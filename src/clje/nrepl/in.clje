@@ -1,0 +1,162 @@
+(ns nrepl.in
+  "BEAM twin of the Java class `nrepl.in.QueuePollingReader`, the reader that
+  a session binds to `*in*`.
+
+  The input lives in a stdin process, because the `stdin` op adds input from
+  one process while the eval reads in another. A read runs in the calling
+  process. So the need-input callback sees the bindings of the eval, such as
+  `nrepl.middleware.interruptible-eval/*msg*`.")
+
+(defn- utf8-length [b]
+  (cond
+    (< b 16r80) 1
+    (= (bit-and b 16rE0) 16rC0) 2
+    (= (bit-and b 16rF0) 16rE0) 3
+    (= (bit-and b 16rF8) 16rF0) 4
+    :else 1))
+
+(defn- split-char
+  "Return [ch rest] for the first UTF-8 character of the binary `b`."
+  [b]
+  (let [n (min (utf8-length (binary/at b 0)) (erlang/byte_size b))]
+    [(erlang/binary_part b 0 n) (erlang/binary_part b n (- (erlang/byte_size b) n))]))
+
+(defn- next-input
+  "Return [item state] with the next input item of `state`: a character, or
+  ::eof, or nil when there is no input. Remove the item if `take?` is true.
+  An ::eof stays in place unless `take?` is true."
+  [{:keys [buf pending] :as state} take?]
+  (cond
+    (and buf (pos? (erlang/byte_size buf)))
+    (let [[ch rest] (split-char buf)]
+      [ch (if take? (assoc state :buf rest) state)])
+
+    (seq pending)
+    (let [item (first pending)]
+      (if (= ::eof item)
+        [::eof (if take? (assoc state :buf nil :pending (vec (rest pending))) state)]
+        (recur (assoc state :buf item :pending (vec (rest pending))) take?)))
+
+    :else
+    [nil (assoc state :buf nil)]))
+
+(defn- reply [from value]
+  (erlang/send (erlang/element 1 from) #erl[(erlang/element 2 from) value]))
+
+(defn- serve-waiters
+  "Answer the waiting readers while there is input."
+  [{:keys [waiters] :as state}]
+  (if-let [[from & more] (seq waiters)]
+    (let [[item state'] (next-input state true)]
+      (if item
+        (do (reply from item)
+            (recur (assoc state' :waiters (vec more))))
+        state))
+    state))
+
+(defn- stdin-loop [state]
+  (receive*
+   #erl[:add input]
+   (recur (serve-waiters (update state :pending conj input)))
+
+   #erl[:unread ch]
+   (recur (assoc state :buf (erlang/iolist_to_binary #erl(ch (or (:buf state) "")))))
+
+   #erl[:poll from take?]
+   (let [[item state] (next-input state take?)]
+     (reply from item)
+     (recur state))
+
+   #erl[:wait from]
+   (recur (serve-waiters (update state :waiters conj from)))
+
+   :close
+   (doseq [from (:waiters state)]
+     (reply from ::eof))))
+
+(defn- call [pid request]
+  (let [ref (erlang/monitor :process pid)]
+    (erlang/send pid (request #erl[(erlang/self) ref]))
+    (receive*
+     #erl[ref value] (do (erlang/demonitor ref #erl(:flush)) value)
+     #erl[:DOWN ref _ _ _] ::eof)))
+
+(declare read-char)
+
+(deftype QueuePollingReader [pid callback]
+  erlang.io.IReader
+  (read [_]
+    (let [ch (read-char pid callback)]
+      (if (= ::eof ch) :eof ch)))
+  (read [_ n]
+    ;; Like the JVM version, the first char may wait for input, and the
+    ;; others take only the input that is already there.
+    (let [first-ch (read-char pid callback)]
+      (if (= ::eof first-ch)
+        :eof
+        (loop [acc [first-ch]]
+          (let [ch (when (< (count acc) n) (call pid (fn [from] #erl[:poll from false])))]
+            (if (and ch (not= ::eof ch))
+              (do (call pid (fn [from] #erl[:poll from true]))
+                  (recur (conj acc ch)))
+              (erlang/iolist_to_binary (clj_rt/to_list acc))))))))
+  (read_line [_]
+    (loop [acc []]
+      (let [ch (read-char pid callback)]
+        (cond
+          (and (= ::eof ch) (empty? acc)) nil
+          (or (= ::eof ch) (= "\n" ch))
+          (let [line (erlang/iolist_to_binary (clj_rt/to_list acc))]
+            (if (= "\r" (last acc))
+              (erlang/binary_part line 0 (dec (erlang/byte_size line)))
+              line))
+          :else (recur (conj acc ch))))))
+  (skip [this n]
+    (let [s (.read this n)]
+      (if (= :eof s) 0 (count s))))
+
+  erlang.io.IPushbackReader
+  (unread [_ s]
+    (erlang/send pid #erl[:unread s]))
+
+  erlang.io.ICloseable
+  (close [_]
+    (erlang/send pid :close))
+
+  clojerl.IStringable
+  (str [_] (str "#<nrepl.in.QueuePollingReader " (pr-str pid) ">")))
+
+(defn- read-char
+  "Return the next character, or ::eof. Without input, call `callback` and
+  wait for input."
+  [pid callback]
+  (let [ch (call pid (fn [from] #erl[:poll from true]))]
+    (if (nil? ch)
+      (do (callback)
+          (call pid (fn [from] #erl[:wait from])))
+      ch)))
+
+(defn queue-polling-reader
+  "Return a new reader that calls `send-need-input-request` when a read
+  finds no input. Call `add-input` or `add-eof` to give it input."
+  [send-need-input-request]
+  (QueuePollingReader.
+   (erlang/spawn (fn [] (stdin-loop {:buf nil :pending [] :waiters []})))
+   send-need-input-request))
+
+(defn add-input
+  "Add the string `input` to the input of `reader`."
+  [^QueuePollingReader reader input]
+  (erlang/send (.-pid reader) #erl[:add input]))
+
+(defn add-eof
+  "Add an end of input to `reader`. The next read that reaches it returns
+  the end of input."
+  [^QueuePollingReader reader]
+  (erlang/send (.-pid reader) #erl[:add ::eof]))
+
+(defn ready?
+  "Return true if `reader` has input that a read can take without waiting."
+  [^QueuePollingReader reader]
+  (let [item (call (.-pid reader) (fn [from] #erl[:poll from false]))]
+    (boolean (and item (not= ::eof item)))))

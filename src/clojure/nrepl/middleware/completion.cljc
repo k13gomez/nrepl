@@ -17,7 +17,8 @@
    [nrepl.middleware :as middleware :refer [set-descriptor!]]
    [nrepl.misc :as misc]
    [nrepl.transport :as t :refer [safe-handle]]
-   [nrepl.util.completion :as complete]))
+   [nrepl.util.completion :as complete]
+   #?@(:clje [[nrepl.beam.compat :refer [requiring-resolve]]])))
 
 (def ^:dynamic *complete-fn*
   "Function to use for completion. Takes three arguments: `prefix`, the completion prefix,
@@ -25,10 +26,16 @@
   options for the completion function."
   complete/completions)
 
-(def ^:private parse-options
+(#?(:clj def :clje comment) ^:private parse-options
   (memoize
    (fn [options]
      (update (walk/keywordize-keys options) :extra-metadata (comp set (partial map keyword))))))
+
+;; clojerl accepts only literal values in a top-level def, so there is no
+;; memoized version on the BEAM.
+#?(:clje
+   (defn- parse-options [options]
+     (update (walk/keywordize-keys options) :extra-metadata (comp set (partial map keyword)))))
 
 (defn completion-reply
   [{:keys [prefix ns complete-fn options] :as msg}]
@@ -36,7 +43,7 @@
         completion-fn (or (try
                             (some-> complete-fn symbol requiring-resolve)
                             ;; See the note in nrepl.middleware.lookup.
-                            (catch Exception _ nil))
+                            (catch #?(:clj Exception :clje _) _ nil))
                           (misc/resolve-in-session msg *complete-fn*))]
     {:status :done
      :completions (completion-fn prefix the-ns (parse-options options))}))

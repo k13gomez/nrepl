@@ -1,0 +1,42 @@
+(ns nrepl.out
+  "BEAM twins of the Java classes `nrepl.out.QuotaBoundWriter` and
+  `nrepl.out.QuotaExceeded`. A shared namespace imports them by the same
+  names on both platforms.")
+
+(deftype QuotaExceeded []
+  clojerl.IError
+  (message [_] "Quota exceeded")
+  (message [this _] this)
+
+  clojerl.IStringable
+  (str [_] "#<nrepl.out.QuotaExceeded>"))
+
+(deftype QuotaBoundWriter [writer quota throw-on-exceeded?]
+  erlang.io.IWriter
+  (write [this s]
+    ;; Each process counts its own writes, in its process dictionary. A
+    ;; writer that several processes share has a quota for each of them.
+    ;; An empty string is a flush, so it always goes through.
+    (if (= "" s)
+      (do (erlang.io.IWriter/write writer s) this)
+      (let [k #erl[::remaining writer quota]
+            remaining (or (erlang/get k) quota)
+            n (count s)
+            too-big? (> n remaining)
+            s (if too-big? (string/slice s 0 remaining) s)]
+        (when (pos? (min n remaining))
+          (erlang.io.IWriter/write writer s)
+          (erlang/put k (- remaining (count s))))
+        (when (and too-big? throw-on-exceeded?)
+          (throw (QuotaExceeded.)))
+        this)))
+  (write [this fmt args]
+    (.write this (erlang/iolist_to_binary (io_lib/format fmt args))))
+
+  erlang.io.ICloseable
+  (close [_]
+    (when (satisfies? erlang.io.ICloseable writer)
+      (erlang.io.ICloseable/close writer)))
+
+  clojerl.IStringable
+  (str [_] (str writer)))

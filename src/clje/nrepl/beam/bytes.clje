@@ -51,6 +51,65 @@
   clojerl.IStringable
   (str [_] "#<nrepl.beam.bytes.BinaryOutput>"))
 
+(defn- utf8-length
+  "Return the byte length of the UTF-8 character that starts with byte `b`.
+  An invalid lead byte counts as one byte."
+  [b]
+  (cond
+    (< b 16r80) 1
+    (= (bit-and b 16rE0) 16rC0) 2
+    (= (bit-and b 16rF0) 16rE0) 3
+    (= (bit-and b 16rF8) 16rF0) 4
+    :else 1))
+
+(defn- read-char
+  "Return the next UTF-8 character of the byte input `input` as a binary,
+  or :eof at the end of the input."
+  [input]
+  (let [b (read-byte input)]
+    (if (neg? b)
+      :eof
+      (let [n (utf8-length b)]
+        (erlang/iolist_to_binary
+         #erl(b (if (> n 1) (read-bytes input (dec n)) "")))))))
+
+(deftype CharReader [input]
+  erlang.io.IReader
+  (read [_]
+    (read-char input))
+  (read [_ n]
+    (loop [acc []
+           n n]
+      (let [ch (if (pos? n) (read-char input) :eof)]
+        (if (= :eof ch)
+          (if (seq acc) (erlang/iolist_to_binary (clj_rt/to_list acc)) :eof)
+          (recur (conj acc ch) (dec n))))))
+  (read_line [_]
+    (loop [acc []]
+      (let [ch (read-char input)]
+        (cond
+          (and (= :eof ch) (empty? acc)) :eof
+          (or (= :eof ch) (= "\n" ch)) (erlang/iolist_to_binary (clj_rt/to_list acc))
+          :else (recur (conj acc ch))))))
+  (skip [this n]
+    (let [s (.read this n)]
+      (if (= :eof s) 0 (count s))))
+
+  erlang.io.IPushbackReader
+  (unread [_ s]
+    ;; Push the bytes back last to first, so that the first byte reads first.
+    (doseq [b (reverse (erlang/binary_to_list s))]
+      (unread input b)))
+
+  clojerl.IStringable
+  (str [_] "#<nrepl.beam.bytes.CharReader>"))
+
+(defn char-reader
+  "Return a reader of UTF-8 characters over the byte input `input`. The
+  clojerl reader and `clojure.edn/read` can read from it."
+  [input]
+  (CharReader. input))
+
 (defn binary-input
   "Return a byte input that reads the binary `b`."
   [b]

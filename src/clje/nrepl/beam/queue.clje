@@ -1,0 +1,93 @@
+(ns nrepl.beam.queue
+  "A queue process. It takes the place of the JVM `LinkedBlockingQueue`
+  and `SynchronousQueue` that nREPL uses.
+
+  A synchronous queue blocks each `put` until a taker gets the item. An
+  unbounded queue returns from `put` at once. The queue process owns the
+  timeouts of `poll`. So an item never goes to a taker that stopped waiting."
+  (:refer-clojure :exclude [take]))
+
+(defn- reply [from value]
+  (erlang/send (erlang/element 1 from) #erl[(erlang/element 2 from) value]))
+
+(defn- serve
+  "Run the queue loop. `items` is a vector of [item putter] pairs, where
+  `putter` is the caller to answer when the item is taken, or nil.
+  `takers` is a vector of [from timer] pairs."
+  [sync? items takers]
+  (receive*
+   #erl[:put from item]
+   (if-let [[[taker timer] & more] (seq takers)]
+     (do (when timer (erlang/cancel_timer timer))
+         (reply taker item)
+         (reply from :ok)
+         (recur sync? items (vec more)))
+     (do (when-not sync? (reply from :ok))
+         (recur sync? (conj items [item (when sync? from)]) takers)))
+
+   #erl[:take from timeout]
+   (if-let [[[item putter] & more] (seq items)]
+     (do (reply from item)
+         (when putter (reply putter :ok))
+         (recur sync? (vec more) takers))
+     (let [ref (erlang/element 2 from)
+           timer (when-not (= timeout :infinity)
+                   (erlang/send_after timeout (erlang/self) #erl[:timeout ref]))]
+       (recur sync? items (conj takers [from timer]))))
+
+   #erl[:timeout ref]
+   (let [expired? (fn [[from _]] (= (erlang/element 2 from) ref))]
+     (doseq [[from _] (filter expired? takers)]
+       (reply from nil))
+     (recur sync? items (vec (remove expired? takers))))
+
+   :close
+   (do (doseq [[from _] takers] (reply from nil))
+       (doseq [[_ putter] items :when putter] (reply putter :closed))
+       :closed)))
+
+(defn start
+  "Start a queue process and return its pid. A `sync?` queue blocks each
+  `put` until a taker gets the item."
+  [sync?]
+  (erlang/spawn (fn [] (serve sync? [] []))))
+
+(defn- call
+  "Send `request` to the queue `q` with a new reply ref, and wait for the
+  reply. Return nil if the queue process is gone."
+  [q request]
+  (let [ref (erlang/monitor :process q)
+        from #erl[(erlang/self) ref]]
+    (erlang/send q (request from))
+    (receive*
+     #erl[ref value]
+     (do (erlang/demonitor ref #erl(:flush))
+         value)
+     #erl[:DOWN ref _ _ _]
+     nil)))
+
+(defn put
+  "Put `item` on the queue `q`. Block until a taker gets it if `q` is
+  synchronous. Return nil."
+  [q item]
+  (call q (fn [from] #erl[:put from item]))
+  nil)
+
+(defn poll
+  "Take the next item from the queue `q`. Wait up to `timeout` ms, or
+  forever if `timeout` is `:infinity`. Return nil on a timeout, or if the
+  queue is closed."
+  [q timeout]
+  (call q (fn [from] #erl[:take from timeout])))
+
+(defn take
+  "Take the next item from the queue `q`. Wait until there is one.
+  Return nil if the queue is closed."
+  [q]
+  (poll q :infinity))
+
+(defn close
+  "Stop the queue `q`. Takers that wait get nil."
+  [q]
+  (erlang/send q :close)
+  nil)

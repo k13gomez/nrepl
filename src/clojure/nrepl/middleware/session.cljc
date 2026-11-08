@@ -3,27 +3,31 @@
   {:author "Chas Emerick"}
   (:require
    [clojure.spec.alpha :as s]
-   [nrepl.config :refer [config]]
+   [nrepl.config :refer [#?(:clj config :clje config*)]]
    [nrepl.middleware :refer [set-descriptor!]]
    [nrepl.middleware.interruptible-eval :refer [*msg*]]
    [nrepl.middleware.print :as print]
    [nrepl.misc :as misc :refer [uuid response-for log ignore-exceptions]]
    [nrepl.transport :as t]
-   [nrepl.util.classloader :as classloader]
+   #?(:clj [nrepl.util.classloader :as classloader])
    [nrepl.util.session :as session-util]
-   [nrepl.util.threading :as threading])
+   [nrepl.util.threading :as threading]
+   #?@(:clje [[nrepl.beam.compat :as compat
+               :refer [assoc! conj! persistent! transient]]
+              [nrepl.beam.queue :as queue]
+              nrepl.in]))
   (:import
-   (clojure.lang Compiler LineNumberingPushbackReader)
-   (java.util.concurrent Executors ExecutorService LinkedBlockingQueue)
-   (nrepl SessionThread)
+   #?@(:clj [(clojure.lang Compiler LineNumberingPushbackReader)
+             (java.util.concurrent Executors ExecutorService LinkedBlockingQueue)
+             (nrepl SessionThread)])
    (nrepl.in QueuePollingReader)))
 
-(def ephemeral-executor
+(#?(:clj def :clje comment) ephemeral-executor
   "Executor for running eval requests in ephemeral sessions."
   (delay (Executors/newCachedThreadPool
           (threading/thread-factory "nREPL-ephemeral-session-%d"))))
 
-(defn- session-in
+(#?(:clj defn- :clje comment) session-in
   "Returns a QueuePollingReader (that is suitable for binding to *in* when
   wrapped into LineNumberingPushbackReader). When something attempts to read
   from it, it will (if empty) send a {:status :need-input} message on the
@@ -33,7 +37,18 @@
                                 (response-for *msg* :session session-id
                                               :status :need-input))))
 
-(let [state (atom {})]
+#?(:clje
+   (defn- session-in
+     "Returns a QueuePollingReader that is suitable for binding to *in*. When
+  something attempts to read from it, it will (if empty) send a
+  {:status :need-input} message on the provided transport so the
+  client/user can provide content to be read."
+     [session-id transport]
+     (nrepl.in/queue-polling-reader #(t/send transport
+                                             (response-for *msg* :session session-id
+                                                           :status :need-input)))))
+
+(#?(:clj let :clje comment) [state (atom {})]
   (defn- dynvar-defaults-from-config []
     ;; Use simple one-value cache if config hasn't changed (config can currently
     ;; only change in tests).
@@ -52,6 +67,28 @@
                               {} dynvars-map)))]
          (reset! state [config m]))))))
 
+;; clojerl cannot define a function inside a `let`, so the cache is a var.
+#?(:clje
+   (def ^:private dynvar-defaults-state (atom {})))
+
+#?(:clje
+   (defn- dynvar-defaults-from-config []
+     (let [config (config*)]
+       (second
+        (if (identical? (first @dynvar-defaults-state) config)
+          @dynvar-defaults-state
+          (let [m (when-some [dynvars-map (:dynamic-vars config)]
+                    (if-not (map? dynvars-map)
+                      (log ":dynamic-vars should be a map")
+                      (reduce-kv (fn [m k default]
+                                   (let [var (ignore-exceptions (resolve k))]
+                                     (if (var? var)
+                                       (assoc m var default)
+                                       (do (log "Could not resolve var:" (str k))
+                                           m))))
+                                 {} dynvars-map)))]
+            (reset! dynvar-defaults-state [config m])))))))
+
 (defn- gather-initial-bindings
   "Return a map of dynamic vars that have to be established for the underlying
   `interruptible-eval` middleware. This should be called when creating a session
@@ -60,24 +97,27 @@
   [_msg]
   (as-> (transient
          ;; Unconditional clojure.main/with-bindings bindings
-         {#'*warn-on-reflection*     *warn-on-reflection*
-          #'*math-context*           *math-context*
+         {#?@(:clj [#'*warn-on-reflection*     *warn-on-reflection*
+                    #'*math-context*           *math-context*])
           #'*print-meta*             *print-meta*
           #'*print-length*           *print-length*
           #'*print-level*            *print-level*
           #'*print-namespace-maps*   true
           #'*data-readers*           *data-readers*
           #'*default-data-reader-fn* *default-data-reader-fn*
-          #'*compile-path*           (System/getProperty "clojure.compile.path" "classes")
+          #'*compile-path*           #?(:clj (System/getProperty "clojure.compile.path" "classes")
+                                        :clje *compile-path*)
           #'*command-line-args*      *command-line-args*
-          #'*unchecked-math*         *unchecked-math*
+          #?@(:clj [#'*unchecked-math*         *unchecked-math*])
           #'*assert*                 *assert*
           #'*1                       nil
           #'*2                       nil
           #'*3                       nil
           #'*e                       nil
+          #?@(:clje [#'*stacktrace              nil
+                     #'*warn-on-infer*          *warn-on-infer*])
           #'*read-eval*              *read-eval*
-          #'*ns*                     (create-ns 'user)
+          #'*ns*                     #?(:clj (create-ns 'user) :clje (compat/user-ns))
           #'s/*explain-out*          s/*explain-out*})
         m
 
@@ -88,7 +128,9 @@
 
     ;; This may contain other bindings established when
     ;; `nrepl.server/start-server` was called.
-    (reduce conj! m (get-thread-bindings))
+    ;; A BEAM process starts without bindings, so there is nothing to keep.
+    ;; It can hold stray entries instead: clojerl `resolve` leaves a *ns* one.
+    #?(:clj (reduce conj! m (get-thread-bindings)) :clje m)
 
     ;; Bindings required for other nREPL middleware to work.
     (reduce (fn [m v] (assoc! m v @v)) m @@#'nrepl.middleware/per-session-dynvars)
@@ -106,10 +148,10 @@
              :out msg {::print/quota out-quota ::print/throw-on-quota-exceeded? false})
         err (print/replying-PrintWriter
              :err msg {::print/quota err-quota ::print/throw-on-quota-exceeded? false})
-        ctxcl (.getContextClassLoader (Thread/currentThread))]
+        #?@(:clj [ctxcl (.getContextClassLoader (Thread/currentThread))])]
     (-> bindings-map
         (assoc #'*msg* msg
-               Compiler/LOADER ctxcl
+               #?@(:clj [Compiler/LOADER ctxcl])
                #'*out* out
                #'*err* err
                ;; clojure.test captures *out* at load-time, so we need to make
@@ -119,9 +161,17 @@
                ;; don't require beforehand in order to not add to loading times.
                (resolve 'clojure.test/*test-out*) out)
         (cond->
-         file (assoc #'*file* file)))))
+         #?@(:clj [file (assoc #'*file* file)])))))
 
-(defn make-ephemeral-exec-fn
+#?(:clje
+   (defn- close-message-writers
+     "Close the *out* and *err* writers of a message. On the BEAM each writer
+  is a process, so it must stop. Closing also sends the last output."
+     [bindings]
+     (doseq [v [#'*out* #'*err*]]
+       (some-> (get bindings v) (.close)))))
+
+(#?(:clj defn :clje comment) make-ephemeral-exec-fn
   "Return an exec function that should be attached to ephemeral sessions.
   Ephemeral exec fn does not persist dynamic bindings and uses
   `ephemeral-executor`. The submitted task is made of:
@@ -139,7 +189,32 @@
                     (finally (pop-thread-bindings))))]
       (.submit ^ExecutorService @ephemeral-executor ^Runnable f))))
 
-(defn session-exec
+#?(:clje
+   (defn make-ephemeral-exec-fn
+     "Return an exec function that should be attached to ephemeral sessions.
+  Ephemeral exec fn does not persist dynamic bindings and runs each task in
+  a new process. The submitted task is made of:
+
+  - an id (typically the message id)
+  - thunk, a function, the task itself
+  - ack, another function, ran to notify of successful execution of thunk"
+     [session msg]
+     (fn [_id thunk ack & [explicit-msg]]
+       (threading/run-with @ephemeral-executor
+         (let [bindings (add-per-message-bindings (or explicit-msg msg)
+                                                  @session)]
+           (push-thread-bindings bindings)
+           (try (thunk)
+                ;; The output must reach the client before the ack.
+                (close-message-writers bindings)
+                (some-> ack (apply nil))
+                (finally
+                  (pop-thread-bindings)
+                  (close-message-writers bindings)
+                  ;; The session goes away, so its stdin process must stop.
+                  (some-> (get @session #'*in*) (.close)))))))))
+
+(#?(:clj defn :clje comment) session-exec
   "Takes a session and returns a map of three functions:
   - `:exec` - takes an id (typically a msg-id), a thunk and an ack runnables.
     Only thunk can be interrupted. Executions are serialized and occur on a
@@ -230,7 +305,94 @@
              ([exec-id r ack msg]
               (.put ^LinkedBlockingQueue (:queue @state) [exec-id r ack msg])))}))
 
-(defn- create-session
+#?(:clje
+   (defn session-exec
+     "Takes a session and returns a map of three functions:
+  - `:exec` - takes an id (typically a msg-id), a thunk and an ack function.
+    Only thunk can be interrupted. Executions are serialized and occur in a
+    single process.
+  - `:interrupt` - takes an id and tries to interrupt the matching execution
+    (submitted with :exec above). A nil id is meant to match the currently
+    running execution. The return value can be either: `:idle` (no running
+    execution), the message of the interrupted execution with its id as `:id`,
+    or nil when the running id doesn't match the id argument. Upon successful
+    interruption the backing process is replaced.
+  - `:close` - terminates the backing process."
+     [session session-id]
+     (let [state (atom nil)
+           session-loop
+           #(try
+              (loop []
+                (let [{:keys [queue]} @state
+                      [exec-id r ack msg] (queue/take queue)
+                      running (assoc msg :id (or exec-id (uuid))) ;; :id may be absent in msg.
+                      bindings (add-per-message-bindings msg @session)]
+                  (swap! state assoc :running running)
+                  (push-thread-bindings bindings)
+                  (r)
+                  (swap! session (fn [current]
+                                   (-> (merge current (compat/thread-bindings))
+                                       ;; Remove vars that we don't want to save
+                                       ;; into the session.
+                                       (dissoc #'*msg*))))
+                  (pop-thread-bindings)
+                  ;; The output must reach the client before the ack.
+                  (close-message-writers bindings)
+                  (let [state-d @state]
+                    ;; An interrupt kills this process, so only a replaced
+                    ;; worker can see another one in the state.
+                    (when (and (= (:worker state-d) (erlang/self))
+                               (compare-and-set! state state-d
+                                                 (assoc state-d :running nil)))
+                      (some-> ack (apply nil))
+                      (recur)))))
+              (catch _ _e
+                ;; This should rarely happen with valid middleware and clients
+                ;; (e.g., it does when responding to a closed transport). But make
+                ;; sure we are still the primary process for the session.
+                (when (= (:worker @state) (erlang/self))
+                  (ignore-exceptions
+                   (some-> (:running @state)
+                           (t/respond-to :status #{:done :error :uncaught-session-exception})))
+                  (ignore-exceptions
+                   (some-> (session-util/resolve-session session-id)
+                           (session-util/close-session))))))
+           reset-state
+           ;; The worker waits for :go, so that it reads the new state.
+           #(let [worker (erlang/spawn (fn [] (receive* :go :ok) (session-loop)))]
+              (some-> (:queue @state) (queue/close))
+              (reset! state {:queue (queue/start false)
+                             :running nil
+                             :worker worker})
+              (erlang/send worker :go))]
+       (reset-state)
+       {:interrupt (fn [exec-id]
+                     ;; nil means interrupt whatever is running
+                     ;; returns :idle, the interrupted message or nil
+                     (let [{:keys [running worker] :as state-d} @state]
+                       (cond
+                         (nil? running) :idle
+                         (and (or (nil? exec-id) (= (:id running) exec-id))
+                              (compare-and-set! state state-d
+                                                (assoc state-d :running nil)))
+                         (do
+                           (threading/interrupt-stop worker)
+                           (reset-state)
+                           running))))
+        :close #(let [{:keys [worker queue]} @state]
+                  (threading/interrupt-stop worker)
+                  (queue/close queue))
+        :exec (fn this
+                ([exec-id r ack]
+                 ;; Here, *msg* is bound by session middleware on the server/handler
+                 ;; process. We have to convey it to the worker process.
+                 (if *msg*
+                   (this exec-id r ack *msg*)
+                   (log "*msg* is unbound in a persistent session.")))
+                ([exec-id r ack msg]
+                 (queue/put (:queue @state) [exec-id r ack msg])))})))
+
+(#?(:clj defn- :clje comment) create-session
   "Return a new session atom that contains a map of dynamic variables needed for
   `interruptible-eval`. If `base-session` is not nil, take dynvar values from it,
   otherwise make one from scratch. If `persistent?` is true, return a persistent
@@ -247,6 +409,30 @@
                           (session-exec new-session id)
                           {:exec (make-ephemeral-exec-fn new-session msg)})))
     new-session))
+
+#?(:clje
+   (defn- create-session
+     "Return a new session atom that contains a map of dynamic variables needed for
+  `interruptible-eval`. If `base-session` is not nil, take dynvar values from it,
+  otherwise make one from scratch. If `persistent?` is true, return a persistent
+  reusable session, otherwise an ephemeral one-shot session."
+     [{:keys [transport] :as msg} base-session persistent?]
+     (let [id (uuid)
+           qpr (session-in id transport)
+           new-session (atom (assoc (or (some-> base-session deref)
+                                        (gather-initial-bindings msg))
+                                    #'*in* qpr))
+           exec-fns (if persistent?
+                      (session-exec new-session id)
+                      {:exec (make-ephemeral-exec-fn new-session msg)})]
+       ;; clojerl atoms do not support reset-meta!. An atom with new meta
+       ;; shares the state of the original.
+       (with-meta new-session
+         (merge {:id id, :transport transport, ::queue-reader qpr}
+                exec-fns
+                (when-let [close (:close exec-fns)]
+                  ;; The stdin process of the session must stop too.
+                  {:close #(do (close) (.close qpr))}))))))
 
 (defn- clone-session
   "Clone bindings of the provided session (or create a fresh one) and
@@ -341,7 +527,7 @@
                  {:requires #{}
                   :expects #{}
                   :describe-fn (fn [{:keys [session]}]
-                                 (when (instance? clojure.lang.Atom session)
+                                 (when (instance? #?(:clj clojure.lang.Atom :clje clojerl.Atom) session)
                                    {:current-ns (-> @session (get #'*ns*) str)}))
                   :handles {"clone"
                             {:doc "Clones the current session, returning the ID of the newly-created session. The new session is closed automatically when the connection that cloned it is closed."
@@ -377,8 +563,8 @@
     (if (= op "stdin")
       (let [^QueuePollingReader qpr (::queue-reader (meta session))]
         (if (empty? stdin)
-          (.addEof qpr)
-          (.addInput qpr stdin))
+          #?(:clj (.addEof qpr) :clje (nrepl.in/add-eof qpr))
+          #?(:clj (.addInput qpr stdin) :clje (nrepl.in/add-input qpr stdin)))
         (t/respond-to msg :status :done))
       (h msg))))
 

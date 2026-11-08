@@ -2,9 +2,11 @@
   "Utilities for injecting output-intercepting writers for System.out and err."
   {:added "1.5"
    :author "Oleksandr Yakushev"}
-  (:require [nrepl.util.threading :as threading])
-  (:import (java.io OutputStreamWriter PrintStream PrintWriter)
-           (nrepl.out CallbackBufferedOutputStream TeeOutputStream)))
+  (:require [nrepl.util.threading :as threading]
+            #?(:clje [nrepl.beam.io :as beam-io]))
+  #?(:clj
+     (:import (java.io OutputStreamWriter PrintStream PrintWriter)
+              (nrepl.out CallbackBufferedOutputStream TeeOutputStream))))
 
 ;;;; State management
 
@@ -16,7 +18,7 @@
   wrapped?
   (atom false))
 
-(defn- capture-original-print-streams
+(#?(:clj defn- :clje comment) capture-original-print-streams
   "Capture the original System.out and err streams if not already captured."
   []
   (let [og-streams @original-print-streams]
@@ -52,7 +54,7 @@
            (% s))
         (vals (get @callbacks stream))))
 
-(defn wrap-standard-streams
+(#?(:clj defn :clje comment) wrap-standard-streams
   "Wraps and substitutes `System/out` and `System/err` to enable output
   interception via callbacks. After calling this function:
 
@@ -98,3 +100,29 @@
         ;; hasn't loaded yet, and we don't need to rebind it.
         (some-> ^clojure.lang.Var (resolve 'clojure.test/*test-out*)
                 (.bindRoot *out*))))))
+
+#?(:clje
+   (defn wrap-standard-streams
+     "Tee the standard output of the VM to enable output interception via
+  callbacks. After calling this function, each process whose group leader is
+  the `user` I/O device gets a tee device as its group leader instead. The
+  tee writes to the `user` device and triggers the `:out` callbacks.
+  Processes that such a process starts later inherit the tee.
+
+  The root binding of *out* is `:standard_io`, which follows the group
+  leader, so it needs no change. Standard error is a registered device that
+  this cannot replace, so `:err` callbacks never run on the BEAM.
+
+  The wrapping is idempotent. Note: This makes global changes to the group
+  leaders of the VM."
+     []
+     (when-not @wrapped?
+       (reset! wrapped? true)
+       (let [user (erlang/whereis :user)
+             tee (beam-io/tee-device user (fn global-out-callback [s]
+                                            (run-stream-callbacks :out s)))]
+         (reset! original-print-streams {:out user})
+         (doseq [pid (erlang/processes)
+                 :let [gl (erlang/process_info pid :group_leader)]
+                 :when (and (erlang/is_tuple gl) (= user (erlang/element 2 gl)))]
+           (erlang/group_leader tee pid))))))

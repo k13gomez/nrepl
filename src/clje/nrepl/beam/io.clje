@@ -1,0 +1,115 @@
+(ns nrepl.beam.io
+  "Writers for the BEAM. They take the place of the JVM
+  `CallbackBufferedOutputStream` and `PrintWriter` stack in
+  `nrepl.middleware.print`.")
+
+(defn- flush-buffer
+  "Call `callback` with the part of `buf` to send now, and return the rest.
+  Send all of `buf` if `force?` is true or `buf` reached `buffer-size`.
+  Otherwise send up to the last newline."
+  [callback buffer-size buf force?]
+  (let [size (erlang/byte_size buf)]
+    (cond
+      (zero? size)
+      buf
+
+      (or force? (>= size buffer-size))
+      (do (callback buf) "")
+
+      :else
+      (let [newlines (binary/matches buf "\n")]
+        (if (empty? newlines)
+          buf
+          (let [end (inc (erlang/element 1 (last newlines)))]
+            (callback (erlang/binary_part buf 0 end))
+            (erlang/binary_part buf end (- size end))))))))
+
+(defn- writer-loop [callback buffer-size buf]
+  (receive*
+   #erl[:write data]
+   (recur callback buffer-size
+          (flush-buffer callback buffer-size (erlang/iolist_to_binary #erl(buf data)) false))
+
+   #erl[:flush from ref]
+   (let [buf (flush-buffer callback buffer-size buf true)]
+     (erlang/send from #erl[ref :ok])
+     (recur callback buffer-size buf))
+
+   #erl[:close from ref]
+   (do (flush-buffer callback buffer-size buf true)
+       (erlang/send from #erl[ref :ok]))))
+
+(defn- call [pid tag]
+  (let [ref (erlang/monitor :process pid)]
+    (erlang/send pid #erl[tag (erlang/self) ref])
+    (receive*
+     #erl[ref :ok] (erlang/demonitor ref #erl(:flush))
+     #erl[:DOWN ref _ _ _] nil)
+    nil))
+
+(deftype CallbackWriter [pid]
+  erlang.io.IWriter
+  (write [this s]
+    (if (= "" s)
+      ;; clojerl `flush` writes an empty string.
+      (call pid :flush)
+      (erlang/send pid #erl[:write s]))
+    this)
+  (write [this fmt args]
+    (.write this (erlang/iolist_to_binary (io_lib/format fmt args))))
+
+  erlang.io.ICloseable
+  (close [_]
+    (call pid :close))
+
+  clojerl.IStringable
+  (str [_] (str "#<nrepl.beam.io.CallbackWriter " (pr-str pid) ">")))
+
+(defn- put-chars-text
+  "Return the text that the I/O request `request` writes, or nil if it
+  writes nothing."
+  [request]
+  (when (erlang/is_tuple request)
+    (let [tag (erlang/element 1 request)
+          size (erlang/tuple_size request)]
+      (cond
+        (and (= :put_chars tag) (= 3 size))
+        (unicode/characters_to_binary (erlang/element 3 request))
+
+        (and (= :put_chars tag) (= 2 size))
+        (unicode/characters_to_binary (erlang/element 2 request))
+
+        (and (= :put_chars tag) (= 5 size))
+        (unicode/characters_to_binary
+         (erlang/apply (erlang/element 3 request) (erlang/element 4 request)
+                       (erlang/element 5 request)))
+
+        (= :requests tag)
+        (let [texts (keep put-chars-text (erlang/element 2 request))]
+          (when (seq texts) (apply str texts)))))))
+
+(defn- tee-loop [device callback]
+  (receive*
+   #erl[:io_request from reply-as request]
+   (let [result (io/request device request)]
+     (erlang/send from #erl[:io_reply reply-as result])
+     (when-let [text (put-chars-text request)]
+       (callback text))
+     (recur device callback))
+
+   _
+   (recur device callback)))
+
+(defn tee-device
+  "Start an I/O server that forwards each request to the I/O device
+  `device`, and calls `callback` with the text of each write. Return its pid."
+  [device callback]
+  (erlang/spawn (fn [] (tee-loop device callback))))
+
+(defn callback-writer
+  "Return a writer that buffers its text and calls `callback` with it. It
+  calls `callback` at a newline, when the buffer reaches `buffer-size`
+  bytes, at a flush and at close. A flush and a close return after the
+  callback ran, so the text arrives before any later message."
+  [callback buffer-size]
+  (CallbackWriter. (erlang/spawn (fn [] (writer-loop callback buffer-size "")))))

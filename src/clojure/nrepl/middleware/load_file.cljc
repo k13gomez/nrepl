@@ -10,8 +10,9 @@
             [nrepl.middleware.caught :as caught]
             [nrepl.middleware.interruptible-eval :as eval]
             [nrepl.middleware.print :as print]
-            [nrepl.misc :refer [resolve-in-session]])
-  (:import (clojure.lang Compiler)
+            [nrepl.misc :refer [resolve-in-session]]
+            #?@(:clje [[nrepl.beam.compat :refer [descriptor-of]]]))
+  (:import #?@(:clj [(clojure.lang Compiler)])
            (nrepl.transport Transport)))
 
 ;; In this middleware, we implement loading whole the file by nREPL from start
@@ -23,10 +24,10 @@
 ;; the old approach.
 
 (defn- per-file-bindings [msg]
-  {Compiler/METHOD nil
-   Compiler/LOCAL_ENV nil
-   Compiler/LOOP_LOCALS nil
-   Compiler/NEXT_LOCAL_NUM 0
+  {#?@(:clj [Compiler/METHOD nil
+             Compiler/LOCAL_ENV nil
+             Compiler/LOOP_LOCALS nil
+             Compiler/NEXT_LOCAL_NUM 0])
    ;; We don't set LINE_BEFORE, COLUMN_BEFORE, LINE_AFTER, COLUMN_AFTER because
    ;; it looks like it doesn't change much for our usecase. But this is still to
    ;; be confirmed.
@@ -34,14 +35,16 @@
    ;; This function runs in "server context" (not yet in session context), so
    ;; make sure to resolve dynvar variables from session.
    #'*ns* (resolve-in-session msg *ns*)
-   #'*unchecked-math* (resolve-in-session msg *unchecked-math*)
-   #'*warn-on-reflection* (resolve-in-session msg *warn-on-reflection*)
+   #?@(:clj [#'*unchecked-math* (resolve-in-session msg *unchecked-math*)
+             #'*warn-on-reflection* (resolve-in-session msg *warn-on-reflection*)])
    #'*data-readers* (resolve-in-session msg *data-readers*)})
 
 (defn- load-file-eval-msg
   [{:keys [file file-path ^Transport transport] :as msg}]
-  (let [last-result (volatile! nil)
-        error-encountered (volatile! false)
+  ;; On the BEAM the eval process writes these, not the process that makes
+  ;; them, so they are atoms there.
+  (let [last-result (#?(:clj volatile! :clje atom) nil)
+        error-encountered (#?(:clj volatile! :clje atom) false)
         wrapped-t (reify Transport
                     (recv [_this] (.recv transport))
                     (recv [_this timeout] (.recv transport timeout))
@@ -50,11 +53,11 @@
                       ;; and don't send it, since `load-file` is supposed to
                       ;; only "return" the result of the last form in the file.
                       (if (contains? resp :value)
-                        (vreset! last-result resp)
+                        (#?(:clj vreset! :clje reset!) last-result resp)
                         (do (when (:ex resp)
                               ;; If an error is thrown, don't send any
                               ;; successful result to the client.
-                              (vreset! error-encountered true))
+                              (#?(:clj vreset! :clje reset!) error-encountered true))
                             ;; This is our signal to send the last result back
                             ;; to the client before sending `done`. Dissoc `:ns`
                             ;; to avoid confusing tools which assume any
@@ -92,6 +95,7 @@
                                               print/wrap-print-optional-arguments
                                               {"file-path" "Source-path-relative path of the source file, e.g. clojure/java/io.clj"
                                                "file-name" "Name of source file, e.g. io.clj"})
-                             :returns (-> (meta #'eval/interruptible-eval)
+                             :returns (-> #?(:clj (meta #'eval/interruptible-eval)
+                                             :clje {::middleware/descriptor (descriptor-of #'eval/interruptible-eval)})
                                           (get-in [::middleware/descriptor :handles "eval" :returns])
                                           (dissoc "ns"))}}})

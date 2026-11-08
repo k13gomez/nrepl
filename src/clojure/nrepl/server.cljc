@@ -15,17 +15,20 @@
    [nrepl.socket :as socket :refer [inet-socket unix-server-socket]]
    [nrepl.tls :as tls]
    [nrepl.transport :as t]
-   [nrepl.util.threading :as threading])
-  (:import
-   (java.net ServerSocket SocketException)
-   (javax.net.ssl SSLException)
-   [java.nio.channels ClosedChannelException]))
+   [nrepl.util.threading :as threading]
+   #?@(:clje [[nrepl.beam.compat :refer [descriptor-of requiring-resolve]]
+              [nrepl.beam.socket :as beam-socket]]))
+  #?(:clj
+     (:import
+      (java.net ServerSocket SocketException)
+      (javax.net.ssl SSLException)
+      [java.nio.channels ClosedChannelException])))
 
 (defn handle*
   [msg handler transport]
   (try
     (handler (assoc msg :transport transport))
-    (catch Throwable t
+    (catch #?(:clj Throwable :clje _) t
       (log t "Unhandled REPL handler exception processing message" msg))))
 
 (defn- normalize-msg
@@ -48,13 +51,13 @@
     (recur handler transport)))
 
 (defn- safe-close
-  [^java.io.Closeable x]
+  [^#?(:clj java.io.Closeable :clje erlang.io.ICloseable) x]
   (try
     (.close x)
-    (catch java.io.IOException e
+    (catch #?(:clj java.io.IOException :clje _) e
       (log e "Failed to close " x))))
 
-(defn- accept-connection-loop
+(#?(:clj defn- :clje comment) accept-connection-loop
   [{:keys [server-socket open-transports transport greeting handler]}
    consume-exception]
   (loop []
@@ -90,15 +93,55 @@
                  (safe-close transport)))))))
       (recur))))
 
+#?(:clje
+   (defn- accept-connection-loop
+     [{:keys [server-socket open-transports transport greeting handler]}
+      consume-exception]
+     (loop []
+       (when-let [sock (try
+                         (socket/accept server-socket)
+                         (catch _ e
+                           (consume-exception e)
+                           (cond
+                             ;; A closed server socket stops the loop.
+                             (beam-socket/disconnected? e)
+                             nil
+
+                             ;; A failed TLS handshake, e.g. a bad client cert,
+                             ;; skips the client but continues the loop.
+                             (beam-socket/tls? server-socket)
+                             :tls-exception
+
+                             :else
+                             (do (log e "Unexpected exception in server loop")
+                                 (safe-close server-socket)
+                                 (log "Shutting down server abruptly")
+                                 nil))))]
+         (when-not (= sock :tls-exception)
+           (threading/run-with @threading/handle-executor
+             (log-exceptions
+              (let [transport (transport sock)]
+                (try
+                  (swap! open-transports conj transport)
+                  (when greeting (greeting transport))
+                  (handle handler transport)
+                  (catch _ e
+                    (when-not (t/disconnected? e)
+                      (throw e)))
+                  (finally
+                    (swap! open-transports disj transport)
+                    (safe-close transport)))))))
+         (recur)))))
+
 (defn stop-server
   "Stops a server started via `start-server`."
-  [{:keys [open-transports ^java.io.Closeable server-socket] :as server}]
+  [{:keys [open-transports #?(:clj ^java.io.Closeable server-socket :clje server-socket)] :as server}]
   (.close server-socket)
   (swap! open-transports
          #(reduce
            (fn [s t]
              ;; should always be true for the socket server...
-             (if (instance? java.io.Closeable t)
+             (if #?(:clj (instance? java.io.Closeable t) :clje (satisfies? erlang.io.ICloseable t))
                (do
                  (safe-close t)
                  (disj s t))
@@ -127,7 +170,7 @@
 (def built-in-ops
   "Get all the op names from default middleware automatically"
   (->> (conj default-middleware #'middleware/wrap-describe)
-       (mapcat #(-> % meta ::middleware/descriptor :handles keys))
+       (mapcat #(-> % #?(:clj meta :clje descriptor-of) #?@(:clj [::middleware/descriptor]) :handles keys))
        set))
 
 (defn- unknown-op-handler
@@ -150,7 +193,8 @@
                (into default-middleware additional-middleware))
         base-handler (middleware/wrap-describe unknown-op-handler stack)
         full-handler (reduce (fn [handler m] (m handler)) base-handler stack)]
-    (with-meta full-handler {:stack stack})))
+    ;; clojerl functions cannot carry metadata.
+    #?(:clj (with-meta full-handler {:stack stack}) :clje full-handler)))
 
 (defrecord
  Server
@@ -169,7 +213,7 @@
             ;; handler. Called with the connection's corresponding
             ;; nrepl.transport/Transport object
   handler]  ;; The message handler function to use for connected clients
-  java.io.Closeable
+  #?(:clj java.io.Closeable :clje erlang.io.ICloseable)
   (close [this] (stop-server this)))
 
 (defn start-server
@@ -203,7 +247,7 @@
    either via `stop-server`, (.close server), or automatically via `with-open`.
    The port that the server is open on is available in the :port slot of the
    server map (useful if the :port option is 0 or was left unspecified."
-  ^nrepl.server.Server
+  ^#?(:clj nrepl.server.Server :clje erlang.Type)
   [& {:keys [port bind socket tls? tls-keys-str tls-keys-file transport-fn handler ack-port greeting-fn consume-exception]
       :or {consume-exception (fn [_] nil)}}]
   (when (and socket (or port bind tls?))
@@ -225,7 +269,8 @@
                  (inet-socket bind port))
         server (Server. ss
                         (when-not socket bind)
-                        (when-not socket (.getLocalPort ^java.net.ServerSocket ss))
+                        (when-not socket #?(:clj (.getLocalPort ^java.net.ServerSocket ss)
+                                            :clje (beam-socket/local-port ss)))
                         socket
                         (atom #{})
                         transport-fn

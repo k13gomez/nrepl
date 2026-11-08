@@ -2,8 +2,9 @@
   "BEAM versions of JVM helpers that nREPL calls in many places.
   A shared namespace refers these names on clje only, so its call sites
   stay the same as on the JVM."
-  (:refer-clojure :exclude [format])
-  (:require [clojure.string :as str]))
+  (:refer-clojure :exclude [format printf])
+  (:require [clojure.string :as str]
+            [nrepl.beam.bytes :as bytes]))
 
 (defn format
   "Format `fmt` with `args` like the JVM `clojure.core/format`.
@@ -19,6 +20,19 @@
         "%%" (recur tokens args (conj acc "%"))
         (recur tokens args (conj acc token)))
       (str/join acc))))
+
+(defn printf
+  "Print `fmt` formatted with `args`, like the JVM `clojure.core/printf`.
+  See `format` for the supported directives."
+  [fmt & args]
+  (print (apply format fmt args)))
+
+(defmacro locking
+  "Evaluate `x`, then run `body`. The BEAM has no monitors on objects.
+  Each nREPL lock guards one write, and one socket send is already atomic.
+  A process that serializes its requests guards the other shared state."
+  [x & body]
+  `(do ~x ~@body))
 
 ;; clojerl has no transients. These versions return persistent
 ;; collections. Code that uses the return values works the same.
@@ -43,10 +57,132 @@
   [m k v]
   (assoc m k v))
 
+(defn requiring-resolve
+  "Resolve the namespace-qualified symbol `sym`. Require its namespace
+  first if needed. clojerl has no `requiring-resolve`."
+  [sym]
+  (if (qualified-symbol? sym)
+    (or (resolve sym)
+        (do (require (symbol (namespace sym)))
+            (resolve sym)))
+    (throw (ex-info (str "Not a qualified symbol: " sym) {:sym sym}))))
+
+;; Middleware descriptors. The JVM keeps them in var metadata with
+;; `alter-meta!`, which clojerl does not support on vars.
+
+(def ^:private descriptors
+  "Map of middleware var to its descriptor."
+  (atom {}))
+
+(defn register-descriptor!
+  "Record `descriptor` as the middleware descriptor of the var `v`."
+  [v descriptor]
+  (swap! descriptors assoc v descriptor)
+  v)
+
+(defn descriptor-of
+  "Return the middleware descriptor of the var `v`. Fall back to the
+  `:nrepl.middleware/descriptor` metadata, which a `def` can set.
+
+  An AOT-compiled namespace does not load the namespaces it requires. A
+  module loads at the first call into it, and only then does its `on_load`
+  register descriptors. So load the module of `v` first."
+  [v]
+  (when-let [ns-sym (:ns (meta v))]
+    (code/ensure_loaded (erlang/binary_to_atom (str ns-sym))))
+  (or (get @descriptors v)
+      (:nrepl.middleware/descriptor (meta v))))
+
+(deftype MetaFn [f m]
+  clojerl.IFn
+  (apply [_ args] (apply f args))
+
+  clojerl.IMeta
+  (meta [_] m)
+  (with_meta [_ m2] (MetaFn. f m2))
+
+  clojerl.IStringable
+  (str [_] (str f)))
+
+(defn fn-with-meta
+  "Return a function that calls `f` and carries the metadata `m`. clojerl
+  functions cannot carry metadata, so `with-meta` fails on them."
+  [f m]
+  (MetaFn. f m))
+
 (defn throwable?
   "Return true if `x` is a clojerl error value."
   [x]
   (satisfies? clojerl.IError x))
+
+(defn root-cause
+  "Return the last error in the `ex-cause` chain of `e`."
+  [e]
+  (loop [e e]
+    (if-let [cause (and (throwable? e) (ex-cause e))]
+      (recur cause)
+      e)))
+
+(defn error-name
+  "Return the name of the error `e` of the Erlang class `kind` (`:error`,
+  `:throw` or `:exit`). A clojerl error gives its type, for example
+  `clojerl.ExceptionInfo`. A raw Erlang term gives the class and the term,
+  for example `error:badarith`."
+  [kind e]
+  (if (throwable? e)
+    (str (type e))
+    (str (name kind) ":" (erlang/iolist_to_binary (io_lib/format "~p" #erl(e))))))
+
+(def ^:private restored-namespaces
+  "Names of the namespaces that `restore-ns-mappings!` already handled."
+  (atom #{}))
+
+(defn restore-ns-mappings!
+  "Evaluate the `ns` form of the namespace `ns` again, if `ns` has no refers.
+  A namespace that clojerl loads from a compiled beam keeps its vars but
+  loses its refers and aliases. Without them, an eval in `ns` cannot
+  resolve `defn` or an alias. The source file comes from the `:file`
+  metadata of the vars. It runs once for each namespace."
+  [ns]
+  (let [ns-sym (ns-name ns)]
+    (when-not (or (contains? @restored-namespaces ns-sym)
+                  (= 'clojure.core ns-sym)
+                  (seq (ns-refers ns)))
+      (swap! restored-namespaces conj ns-sym)
+      (when-let [file (some (fn [[_ v]] (:file (meta v))) (ns-interns ns))]
+        (when (filelib/is_regular file)
+          (let [form (read {:read-cond :allow :eof nil}
+                           (bytes/char-reader (bytes/binary-input (slurp file))))]
+            (when (and (seq? form) (= 'ns (first form)))
+              (binding [*ns* ns]
+                (eval form)))))))))
+
+(defn thread-bindings
+  "Return the dynamic bindings of the current process as a map of var to
+  value, like the JVM `get-thread-bindings`. clojerl returns the vars as
+  strings such as \"#'clojure.core/*ns*\"."
+  []
+  (into {}
+        (keep (fn [[k v]]
+                (when-let [var (find-var (symbol (erlang/binary_part k 2 (- (erlang/byte_size k) 2))))]
+                  [var v])))
+        (get-thread-bindings)))
+
+(defn user-ns
+  "Return the `user` namespace, with clojure.core referred. clojerl
+  `create-ns` sets `*ns*` and refers nothing, so this does not use it.
+  The work runs in a new process. A clojerl `binding` leaves a `*ns*`
+  entry in `get-thread-bindings` after it ends, and the caller must not
+  get that entry."
+  []
+  (let [parent (erlang/self)
+        ref (erlang/make_ref)]
+    (erlang/spawn (fn []
+                    (erlang/send parent #erl[ref (binding [*ns* *ns*]
+                                                   (in-ns 'user)
+                                                   (refer-clojure)
+                                                   *ns*)])))
+    (receive* #erl[ref ns] ns)))
 
 (defn getenv
   "Return the value of the environment variable `k` as a string.

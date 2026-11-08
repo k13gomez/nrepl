@@ -15,7 +15,8 @@
    [nrepl.middleware :as middleware :refer [set-descriptor!]]
    [nrepl.misc :as misc]
    [nrepl.transport :as t :refer [safe-handle]]
-   [nrepl.util.lookup :as lookup]))
+   [nrepl.util.lookup :as lookup]
+   #?@(:clje [[nrepl.beam.compat :refer [requiring-resolve]]])))
 
 (def ^:dynamic *lookup-fn*
   "Function to use for lookup. Takes two arguments:
@@ -32,7 +33,7 @@
                         (some-> lookup-fn symbol requiring-resolve)
                         ;; An unresolvable client-supplied fn falls back to the
                         ;; session's, rather than failing the request.
-                        (catch Exception _ nil))
+                        (catch #?(:clj Exception :clje _) _ nil))
                       (misc/resolve-in-session msg *lookup-fn*))]
     {:status :done, :info (lookup-fn the-ns sym)}))
 

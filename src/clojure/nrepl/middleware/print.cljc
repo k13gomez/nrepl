@@ -7,11 +7,15 @@
   (:require
    [nrepl.middleware :refer [set-descriptor!]]
    [nrepl.misc :as misc]
-   [nrepl.transport :as transport])
+   [nrepl.transport :as transport]
+   #?@(:clje [[nrepl.beam.compat :refer [requiring-resolve]]
+              [nrepl.beam.io :as beam-io]
+              nrepl.out]))
   (:import
-   (clojure.lang RT)
-   (java.io OutputStreamWriter PrintWriter StringWriter Writer)
-   (nrepl.out CallbackBufferedOutputStream QuotaBoundWriter QuotaExceeded)
+   #?@(:clj [(clojure.lang RT)
+             (java.io OutputStreamWriter PrintWriter StringWriter Writer)
+             (nrepl.out CallbackBufferedOutputStream QuotaBoundWriter QuotaExceeded)]
+       :clje [(nrepl.out QuotaBoundWriter QuotaExceeded)])
    (nrepl.transport Transport)))
 
 (def ^:dynamic *print-fn*
@@ -42,13 +46,13 @@
   "Returns a `java.io.Writer` that wraps `writer` and throws `QuotaExceeded` once
   it has written more than `quota` bytes if `throw-on-exceeded?` is true, otherwise
   only truncate the output."
-  ^Writer
-  [^Writer writer quota throw-on-exceeded?]
+  ^#?(:clj Writer :clje erlang.Type)
+  [^#?(:clj Writer :clje erlang.Type) writer quota throw-on-exceeded?]
   (if quota
     (QuotaBoundWriter. writer quota throw-on-exceeded?)
     writer))
 
-(defn replying-PrintWriter
+(#?(:clj defn :clje comment) replying-PrintWriter
   "Returns a `java.io.PrintWriter` suitable for binding as `*out*` or `*err*`. All
   of the content written to that `PrintWriter` will be sent as messages on the
   transport of `msg`, keyed by `key`. `::throw-on-quota-exceeded?` should
@@ -61,7 +65,18 @@
       (with-quota-bound-writer (::quota opts *quota*) (::throw-on-quota-exceeded? opts true))
       (PrintWriter. true)))
 
-(defn- send-streamed
+#?(:clje
+   (defn replying-PrintWriter
+     "Returns a writer suitable for binding as `*out*` or `*err*`. All
+  of the content written to that writer will be sent as messages on the
+  transport of `msg`, keyed by `key`. `::throw-on-quota-exceeded?` should
+  only be set to false by session middleware to create *out*/*err* streams."
+     [key msg opts]
+     (-> (beam-io/callback-writer #(transport/respond-to msg key %)
+                                  (or (::buffer-size opts) *buffer-size* 1024))
+         (with-quota-bound-writer (::quota opts *quota*) (::throw-on-quota-exceeded? opts true)))))
+
+(#?(:clj defn- :clje comment) send-streamed
   [msg resp print-fn {:keys [::keys] :as opts}]
   ;; Iterator is used instead of reduce for cleaner stacktrace if an exception
   ;; gets thrown during printing.
@@ -75,7 +90,18 @@
                (transport/respond-to msg :status ::truncated))))))
   (transport/respond-to msg (apply dissoc resp keys)))
 
-(defn- send-nonstreamed
+#?(:clje
+   (defn- send-streamed
+     [msg resp print-fn {:keys [::keys] :as opts}]
+     (doseq [key keys
+             :let [value (get resp key)]]
+       (try (with-open [writer (replying-PrintWriter key msg opts)]
+              (print-fn value writer))
+            (catch QuotaExceeded _
+              (transport/respond-to msg :status ::truncated))))
+     (transport/respond-to msg (apply dissoc resp keys))))
+
+(#?(:clj defn- :clje comment) send-nonstreamed
   [msg resp print-fn {:keys [::keys] :as opts}]
   ;; Iterator is used instead of reduce for cleaner stacktrace if an exception
   ;; gets thrown during printing.
@@ -96,6 +122,31 @@
                                     (::truncated-keys resp)
                                     (update :status #(set (conj % ::truncated)))))))))
 
+#?(:clje
+   (defn- send-nonstreamed
+     [msg resp print-fn {:keys [::keys] :as opts}]
+     (loop [resp resp
+            keys (seq keys)]
+       (if keys
+         (let [key (first keys)
+               value (get resp key)
+               string-writer (erlang.io.StringWriter.)
+               writer (with-quota-bound-writer string-writer (::quota opts *quota*) true)
+               truncated? (try (print-fn value writer)
+                               false
+                               (catch QuotaExceeded _
+                                 true))
+               ;; A clojerl StringWriter is a process, so close it.
+               printed (str string-writer)]
+           (.close string-writer)
+           (recur (cond-> (assoc resp key printed)
+                    truncated? (update ::truncated-keys (fnil conj []) key))
+                  (next keys)))
+
+         (transport/respond-to msg (cond-> resp
+                                     (::truncated-keys resp)
+                                     (update :status #(set (conj % ::truncated)))))))))
+
 (defn- resolve-print
   [{:keys [::print ::options] :as msg}]
   (when-let [var-sym (some-> print (symbol))]
@@ -103,7 +154,7 @@
                          (requiring-resolve var-sym)
                          ;; The symbol comes from the client, so a missing
                          ;; namespace or an unqualified name is a user error.
-                         (catch Exception _ nil))]
+                         (catch #?(:clj Exception :clje _) _ nil))]
       (fn [value writer]
         (print-var value writer options))
       (do (transport/respond-to msg {::error (str "Couldn't resolve var " var-sym)

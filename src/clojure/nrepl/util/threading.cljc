@@ -4,14 +4,15 @@
   {:added "1.3"}
   (:require
    [nrepl.misc :as misc]
-   [nrepl.util.classloader :as classloader])
-  (:import
-   (java.lang.reflect Method)
-   (java.util.concurrent Executors ExecutorService ScheduledExecutorService
-                         TimeUnit)
-   (nrepl DaemonThreadFactory)))
+   #?(:clj [nrepl.util.classloader :as classloader]))
+  #?(:clj
+     (:import
+      (java.lang.reflect Method)
+      (java.util.concurrent Executors ExecutorService ScheduledExecutorService
+                            TimeUnit)
+      (nrepl DaemonThreadFactory))))
 
-(defn thread-factory
+(#?(:clj defn :clje comment) thread-factory
   "Return a thread factory that produces daemon threads with the name specified by
   `thread-name-fmt`."
   [thread-name-fmt]
@@ -22,33 +23,37 @@
   executor itself is blocking)."
   {:style/indent 1}
   [executor & body]
-  `(.submit ~(with-meta executor {:tag (symbol (.getName ExecutorService))})
-            (reify Runnable
-              (run [_#]
-                ~@body))))
+  #?(:clj
+     `(.submit ~(with-meta executor {:tag (symbol (.getName ExecutorService))})
+               (reify Runnable
+                 (run [_#]
+                   ~@body)))
+     ;; The BEAM runs `body` in a new process. The executor form is not
+     ;; evaluated, so the executors below do not exist on clje.
+     :clje `(erlang/spawn (fn [] ~@body))))
 
 ;; Executors are wrapped in delays to defer their initialization.
 
-(def listen-executor
+(#?(:clj def :clje comment) listen-executor
   "Executor used to accept incoming connections."
   (delay (Executors/newCachedThreadPool (thread-factory "nREPL-server-%d"))))
 
-(def transport-executor
+(#?(:clj def :clje comment) transport-executor
   "Executor used to run the transport handler loop and handle individual requests."
   (delay (Executors/newCachedThreadPool (thread-factory "nREPL-transport-%d"))))
 
-(def handle-executor
+(#?(:clj def :clje comment) handle-executor
   "Executor used to run the handler loop and handle individual requests."
   (delay (Executors/newCachedThreadPool (thread-factory "nREPL-handler-%d"))))
 
 ;;;; Thread interruption. Used by session middleware to make eval interruptible.
 
-(def thread-reaper-executor
+(#?(:clj def :clje comment) thread-reaper-executor
   "Executor used to kill session threads that did not respond to interrupt."
   (delay (Executors/newScheduledThreadPool
           0 (thread-factory "nREPL-thread-reaper-%d"))))
 
-(defn- deprecated-thread-stop [t]
+(#?(:clj defn- :clje comment) deprecated-thread-stop [t]
   (try
     ;; JDK26+ has removed Thread.stop completely, so to avoid linter warnings,
     ;; use a roundabout reflection method to invoke it.
@@ -56,10 +61,10 @@
       (.invoke ^Method m t (object-array 0)))
     (catch NoSuchMethodException _)))
 
-(defn- jvmti-stop-thread [t]
+(#?(:clj defn- :clje comment) jvmti-stop-thread [t]
   ((requiring-resolve 'nrepl.util.jvmti/stop-thread) t))
 
-(defn- try-stop-thread [^Thread t]
+(#?(:clj defn- :clje comment) try-stop-thread [^Thread t]
   (cond
     (<= misc/java-version 19) (deprecated-thread-stop t)
     ;; Since JDK20, Thread.stop() no longer works. We must resort to using
@@ -75,7 +80,7 @@
 
 (def ^:private force-stop-delay-ms 5000)
 
-(defn interrupt-stop
+(#?(:clj defn :clje comment) interrupt-stop
   "Try to interrupt the thread normally. Asynchronously wait for 5000ms and, if
   the thread didn't terminate itself cleanly, kill the thread using either
   `.stop` or JVMTI agent. This behaviour strikes a balance between allowing a
@@ -89,3 +94,27 @@
                          (when-not (= (.getState t) Thread$State/TERMINATED)
                            (try-stop-thread t)))
              ^long force-stop-delay-ms TimeUnit/MILLISECONDS))
+
+#?(:clje
+   (defn- compile-child?
+     "Return true if `pid` is a clojerl compiler process. An eval runs a
+  `def` init and the compile step in such a child of the caller."
+     [pid]
+     (let [dict (erlang/process_info pid :dictionary)]
+       (and (erlang/is_tuple dict)
+            (some #(= :$clj_module_compiling (erlang/element 1 %))
+                  (erlang/element 2 dict))))))
+
+#?(:clje
+   (defn interrupt-stop
+     "Kill the process `pid` at once. The BEAM can always stop a process, so
+  there is no grace period as on the JVM. First kill the compiler processes
+  that `pid` monitors, because they do not die with it."
+     [pid]
+     (let [monitors (erlang/process_info pid :monitors)]
+       (when (erlang/is_tuple monitors)
+         (doseq [m (erlang/element 2 monitors)
+                 :let [child (erlang/element 2 m)]
+                 :when (and (erlang/is_pid child) (compile-child? child))]
+           (erlang/exit child :kill))))
+     (erlang/exit pid :kill)))

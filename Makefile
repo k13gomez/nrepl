@@ -20,10 +20,15 @@ test: javac-test
 
 # BEAM build for clojerl. Set CLJE_NS to test one namespace, for example
 # CLJE_NS=nrepl.bencode-test make clje-test.
+# The nrepl namespaces always build from clean. rebar3_clojerl does not
+# recompile the namespaces that extend a protocol when the protocol changes.
+# Only the nrepl.* beams go: the nrepl ebin also holds protocol modules of
+# the dependencies, which rebar3_clojerl writes there and does not rebuild.
 clje-compile:
+	rm -f _build/test/lib/nrepl/ebin/nrepl.*.beam
 	rebar3 as test clojerl compile
 
-clje-test:
+clje-test: clje-compile
 	rebar3 as test clojerl test $(if $(CLJE_NS),--ns $(CLJE_NS))
 
 eastwood: javac-test

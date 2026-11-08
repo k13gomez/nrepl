@@ -5,29 +5,37 @@
   compatibility layer for bidirectional read and write:
   https://bugs.openjdk.java.net/browse/JDK-4509080."
   (:require
-   [clojure.java.io :as io]
+   #?(:clj [clojure.java.io :as io])
    [nrepl.misc :refer [log]]
-   [nrepl.tls :as tls])
-  (:import
-   (java.io BufferedInputStream BufferedOutputStream OutputStream)
-   (java.net InetSocketAddress ServerSocket Socket URI)
-   (java.nio ByteBuffer)
-   (java.nio.channels Channels ClosedChannelException ServerSocketChannel SocketChannel)
-   (javax.net.ssl SSLServerSocket)))
+   [nrepl.tls :as tls]
+   #?@(:clje [[nrepl.beam.bytes :as bytes]
+              [nrepl.beam.compat :refer [requiring-resolve]]
+              [nrepl.beam.socket :as beam-socket]]))
+  #?(:clj
+     (:import
+      (java.io BufferedInputStream BufferedOutputStream OutputStream)
+      (java.net InetSocketAddress ServerSocket Socket URI)
+      (java.nio ByteBuffer)
+      (java.nio.channels Channels ClosedChannelException ServerSocketChannel SocketChannel)
+      (javax.net.ssl SSLServerSocket))
+     :clje
+     (:import
+      (nrepl.beam.socket Connection ServerSocket))))
 
 ;;; InetSockets (TCP)
 
 (defn inet-socket
   ([bind port]
    (let [port (or port 0)
-         addr (fn [^String bind port] (InetSocketAddress. bind (int port)))
+         #?@(:clj [addr (fn [^String bind port] (InetSocketAddress. bind (int port)))])
          ;; We fallback to 127.0.0.1 instead of to localhost to avoid
          ;; a dependency on the order of ipv4 and ipv6 records for
          ;; localhost in /etc/hosts
          bind (or bind "127.0.0.1")]
-     (doto (ServerSocket.)
-       (.setReuseAddress true)
-       (.bind (addr bind port)))))
+     #?(:clj (doto (ServerSocket.)
+               (.setReuseAddress true)
+               (.bind (addr bind port)))
+        :clje (beam-socket/tcp-server-socket bind port))))
   ([bind port tls-context]
    (let [port (or port 0)
          ;; We fallback to 127.0.0.1 instead of to localhost to avoid
@@ -48,17 +56,20 @@
     (throw (ex-info msg {:nrepl/kind ::no-filesystem-sockets}))))
 
 (def unix-domain-flavor
-  (cond
-    (resolve 'java.net.UnixDomainSocketAddress) :jdk
-    (resolve 'org.newsclub.net.unix.AFUNIXSocketAddress) :junixsocket
-    :else nil))
+  #?(:clj (cond
+            (resolve 'java.net.UnixDomainSocketAddress) :jdk
+            (resolve 'org.newsclub.net.unix.AFUNIXSocketAddress) :junixsocket
+            :else nil)
+     ;; gen_tcp supports filesystem sockets on every BEAM.
+     :clje :beam))
 
 (defn unix-server-socket
   "Returns a server filesystem socket bound to the path based on available
   implementation. Throws ex-info map with {:nrepl/kind ::no-filesystem-sockets}
   if none is available."
-  ^ServerSocketChannel [path]
+  ^#?(:clj ServerSocketChannel :clje erlang.Type) [path]
   (case unix-domain-flavor
+    #?@(:clje [:beam (beam-socket/unix-server-socket path)])
     :jdk
     ((requiring-resolve 'nrepl.socket.jdk17/unix-server-socket) path)
     :junixsocket
@@ -70,8 +81,9 @@
   "Returns a client filesystem socket bound to the path based on available
   implementation. Throws ex-info map with {:nrepl/kind ::no-filesystem-sockets}
   if none is available."
-  ^SocketChannel [path]
+  ^#?(:clj SocketChannel :clje erlang.Type) [path]
   (case unix-domain-flavor
+    #?@(:clje [:beam (beam-socket/unix-client path)])
     :jdk
     ((requiring-resolve 'nrepl.socket.jdk17/unix-client-socket) path)
     :junixsocket
@@ -79,7 +91,7 @@
     ;; else
     (throw-no-sockets)))
 
-(defn- get-socket-address-path
+(#?(:clj defn- :clje comment) get-socket-address-path
   "Given a socket address instance, return its filesystem path as a
   string. Depends on loaded Unix socket implementation."
   [addr]
@@ -93,7 +105,7 @@
 
 ;;;; Common parts.
 
-(defn as-nrepl-uri
+(#?(:clj defn :clje comment) as-nrepl-uri
   "Constructs an nREPL URI from a server map and transport scheme.
   Takes a map with :server-socket and :host keys (as in nrepl.server/Server)."
   ^URI [{:keys [host server-socket]} transport-scheme]
@@ -110,6 +122,18 @@
           (.getLocalPort ^ServerSocket server-socket)
           nil nil nil)))
 
+#?(:clje
+   (defn as-nrepl-uri
+     "Constructs an nREPL URI from a server map and transport scheme.
+  Takes a map with :server-socket and :host keys (as in nrepl.server/Server).
+  The BEAM has no URI type, so it returns the URI as a string."
+     [{:keys [host server-socket]} transport-scheme]
+     (if-let [path (beam-socket/unix-path server-socket)]
+       (str transport-scheme "+unix:" (filename/absname path))
+       (str transport-scheme
+            (when (beam-socket/tls? server-socket) "s")
+            "://" host ":" (beam-socket/local-port server-socket)))))
+
 (defprotocol Acceptable
   (accept [s]
     "Accepts a connection on s.  Throws ClosedChannelException if s is
@@ -119,7 +143,7 @@
 ;; messages written one after another, like an eval's value and then its
 ;; done, and with Nagle's algorithm each one waits for the client to
 ;; acknowledge the one before, which Linux delays by up to 40ms.
-(extend-protocol Acceptable
+(#?(:clj extend-protocol :clje comment) Acceptable
   ServerSocketChannel
   (accept [s] (.accept s))
 
@@ -137,16 +161,27 @@
     (doto (.accept s)
       (.setTcpNoDelay true))))
 
+;; Accepted BEAM sockets inherit TCP_NODELAY from the listen socket.
+#?(:clje
+   (extend-protocol Acceptable
+     ServerSocket
+     (accept [s]
+       (if (beam-socket/tls? s)
+         (tls/accept s)
+         (beam-socket/accept s)))))
+
 (defprotocol Connectable
   (is-connected? [s]
     "Returns true if socket-like thing `s` is currently connected."))
 
 (extend-protocol Connectable
-  SocketChannel
-  (is-connected? [s] (.isConnected s))
+  #?@(:clj [SocketChannel
+            (is-connected? [s] (.isConnected s))
 
-  Socket
-  (is-connected? [s] (.isConnected s)))
+            Socket
+            (is-connected? [s] (.isConnected s))]
+      :clje [Connection
+             (is-connected? [s] (beam-socket/connected? s))]))
 
 ;; We have to handle this ourselves for NIO because unfortunately read and write
 ;; hang if we use both Channels/newInputStream and Channels/newOutputStream.
@@ -161,15 +196,23 @@
     [w byte-array offset length]
     "Writes the given bytes to the output as per OutputStream write."))
 
-(extend-protocol Writable
+(#?(:clj extend-protocol :clje comment) Writable
   OutputStream
   (write
     ([s byte-array] (.write ^OutputStream s ^"[B" byte-array))
     ([s byte-array offset length]
      (.write ^OutputStream s byte-array offset length))))
 
-(defrecord BufferedOutputChannel
-           [^SocketChannel channel ^ByteBuffer buffer]
+#?(:clje
+   (extend-protocol Writable
+     Connection
+     (write
+       ([s data] (bytes/write s data))
+       ([s data offset length]
+        (bytes/write s (erlang/binary_part data offset length))))))
+
+(#?(:clj defrecord :clje comment) BufferedOutputChannel
+                                  [^SocketChannel channel ^ByteBuffer buffer]
 
   java.io.Flushable
   (flush [_this] ;; Underscore was added to satisfy clj-kondo
@@ -190,7 +233,7 @@
           (.flush this))
         (.put buffer byte-array offset length)))))
 
-(defn buffered-output-channel [^SocketChannel channel bytes]
+(#?(:clj defn :clje comment) buffered-output-channel [^SocketChannel channel bytes]
   (assert (.isBlocking channel))
   (->BufferedOutputChannel channel (ByteBuffer/allocate bytes)))
 
@@ -199,17 +242,22 @@
     "Returns a buffered stream (subset of BufferedInputStream) reading from x."))
 
 (extend-protocol AsBufferedInputStreamSubset
-  ;; Use the Channels stream for input but not output to avoid the deadlock
-  SocketChannel (buffered-input [s] (-> s Channels/newInputStream io/input-stream))
-  Socket (buffered-input [s] (io/input-stream s))
-  BufferedInputStream (buffered-input [s] s))
+  #?@(:clj [;; Use the Channels stream for input but not output to avoid the deadlock
+            SocketChannel (buffered-input [s] (-> s Channels/newInputStream io/input-stream))
+            Socket (buffered-input [s] (io/input-stream s))
+            BufferedInputStream (buffered-input [s] s)]
+      ;; A BEAM connection buffers its own input. Any other byte input
+      ;; (for example a binary input in tests) is used as it is.
+      :clje [default (buffered-input [s] s)]))
 
 (defprotocol AsBufferedOutputStreamSubset
   (buffered-output [x]
     "Returns a buffered stream (subset of BufferedOutputStream) reading from x."))
 
 (extend-protocol AsBufferedOutputStreamSubset
-  ;; Use the Channels stream for input but not output to avoid the deadlock
-  SocketChannel (buffered-output [s] (buffered-output-channel s 8192))
-  Socket (buffered-output [s] (io/output-stream s))
-  BufferedOutputStream (buffered-output [s] s))
+  #?@(:clj [;; Use the Channels stream for input but not output to avoid the deadlock
+            SocketChannel (buffered-output [s] (buffered-output-channel s 8192))
+            Socket (buffered-output [s] (io/output-stream s))
+            BufferedOutputStream (buffered-output [s] s)]
+      ;; A BEAM connection writes each message with one send.
+      :clje [default (buffered-output [s] s)]))

@@ -10,14 +10,17 @@
    [nrepl.middleware :refer [set-descriptor!]]
    [nrepl.middleware.print :as print]
    [nrepl.misc :as misc]
-   [nrepl.transport :as transport])
+   [nrepl.transport :as transport]
+   #?@(:clje [[nrepl.beam.compat :refer [requiring-resolve]]]))
   (:import
    (nrepl.transport Transport)))
 
 (def ^:dynamic *caught-fn*
   "Function to use to convey interactive errors (generally by printing to
   `*err*`). Takes one argument, a `java.lang.Throwable`."
-  clojure.main/repl-caught)
+  #?(:clj clojure.main/repl-caught
+     ;; clojerl keeps the stack trace apart from the error, in *stacktrace.
+     :clje (fn [e] (clojure.main/repl-caught e *stacktrace))))
 
 (defn- bound-configuration
   []
@@ -31,7 +34,7 @@
     (let [caught-var (try
                        (requiring-resolve var-sym)
                        ;; See the note in nrepl.middleware.print/resolve-print.
-                       (catch Exception _ nil))]
+                       (catch #?(:clj Exception :clje _) _ nil))]
       (when-not caught-var
         (transport/respond-to msg {::error (str "Couldn't resolve var " var-sym)
                                    :status ::error}))

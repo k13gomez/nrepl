@@ -9,8 +9,9 @@
   {:author "Bozhidar Batsov"
    :added "0.8"}
   (:require
-   [clojure.java.io :as io]
-   [nrepl.misc :as misc]))
+   #?(:clj [clojure.java.io :as io])
+   [nrepl.misc :as misc]
+   #?(:clje [nrepl.beam.compat :refer [requiring-resolve]])))
 
 (defn special-sym-meta
   [sym]
@@ -19,24 +20,32 @@
   (let [f (requiring-resolve 'clojure.repl/special-doc)]
     (assoc (f sym)
            :ns "clojure.core"
-           :file "clojure/core.clj"
+           :file #?(:clj "clojure/core.clj" :clje "clojure/core.clje")
            :special-form "true")))
 
 (defn normal-sym-meta
   [ns sym]
   (some-> (ns-resolve ns sym) meta))
 
-(defn- ns-file
+(#?(:clj defn- :clje comment) ns-file
   "The classpath-relative path of the file `the-ns` loads from, if any."
   [the-ns]
   (let [base (-> (name (ns-name the-ns)) (.replace \- \_) (.replace \. \/))]
     (first (filter io/resource (map #(str base %) [".clj" ".cljc"])))))
 
+#?(:clje
+   (defn- ns-file
+     "The path of the file `the-ns` loads from, if any. The BEAM has no
+  classpath resources, so this takes the `:file` metadata of its vars."
+     [the-ns]
+     (some (fn [[_ v]] (:file (meta v))) (ns-interns the-ns))))
+
 (defn ns-sym-meta
   "The metadata of the namespace `sym` names, an alias in `ns` or the
   namespace's own name."
   [ns sym]
-  (when-let [the-ns (or (get (ns-aliases ns) sym) (find-ns sym))]
+  ;; clojerl keys the aliases by string.
+  (when-let [the-ns (or (get (ns-aliases ns) #?(:clj sym :clje (str sym))) (find-ns sym))]
     (let [ns-sym (ns-name the-ns)
           file (ns-file the-ns)]
       (cond-> (assoc (meta the-ns) :ns ns-sym :name ns-sym)

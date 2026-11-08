@@ -1,12 +1,43 @@
 (ns nrepl.core
   "High level nREPL client support."
   {:author "Chas Emerick"}
+  #?(:clje (:refer-clojure :exclude [format]))
   (:require
    [nrepl.misc :refer [take-until uuid]]
    [nrepl.socket :as socket]
    [nrepl.tls :as tls]
    [nrepl.transport :as transport]
-   [nrepl.version :as version]))
+   [nrepl.version :as version]
+   #?@(:clje [[nrepl.beam.compat :refer [fn-with-meta format]]
+              [nrepl.beam.socket :as beam-socket]])))
+
+;; clojerl lazy seqs do not cache their values. Each traversal calls the
+;; seq fn again, so a lazy seq over `recv` would lose messages. On the BEAM,
+;; the received messages go into a cache, and the seq cells read it by index.
+
+#?(:clje
+   (defn- cached-recv
+     "Return message `i` from `cache`, an atom of `{:msgs [...] :end nil}`.
+  Receive it from `transport` if it is the next one. Return nil at the end
+  of the seq, which a recv timeout marks in `:end`."
+     [transport timeout cache i]
+     (let [{:keys [msgs end]} @cache]
+       (cond
+         (< i (count msgs)) (nth msgs i)
+         (= i end) nil
+         :else (if-some [resp (transport/recv transport timeout)]
+                 (do (swap! cache update :msgs conj resp)
+                     resp)
+                 (do (swap! cache assoc :end i)
+                     nil))))))
+
+#?(:clje
+   (defn- cached-recv-seq
+     "Return a lazy seq of the messages in `cache` from index `i` on."
+     [transport timeout cache i]
+     (lazy-seq
+      (when-some [resp (cached-recv transport timeout cache i)]
+        (cons resp (cached-recv-seq transport timeout cache (inc i)))))))
 
 (defn response-seq
   "Returns a lazy seq of messages received via the given Transport.
@@ -14,11 +45,12 @@
    The seq will end only when the underlying Transport is closed (i.e.
    returns nil from `recv`) or if a message takes longer than `timeout`
    millis to arrive."
-  ([transport] (response-seq transport Long/MAX_VALUE))
+  ([transport] (response-seq transport #?(:clj Long/MAX_VALUE :clje :infinity)))
   ([transport timeout]
-   (take-while identity (repeatedly #(transport/recv transport timeout)))))
+   #?(:clj (take-while identity (repeatedly #(transport/recv transport timeout)))
+      :clje (cached-recv-seq transport timeout (atom {:msgs [] :end nil}) 0))))
 
-(defn client
+(#?(:clj defn :clje comment) client
   "Returns a fn of zero and one argument, both of which return the current head of a single
    response-seq being read off of the given client-side transport.  The one-arg arity will
    send a given message on the transport before returning the seq.
@@ -44,6 +76,31 @@
        (transport/send transport msg)
        (this)))))
 
+#?(:clje
+   (defn client
+     "Returns a fn of zero and one argument, both of which return the current head of a single
+   response-seq being read off of the given client-side transport.  The one-arg arity will
+   send a given message on the transport before returning the seq.
+
+   Most REPL interactions are best performed via `message` and `client-session` on top of
+   a client fn returned from this fn."
+     [transport response-timeout]
+     (let [cache (atom {:msgs [] :end nil})]
+       ;; clojerl functions cannot carry metadata.
+       (fn-with-meta
+        (fn this
+          ;; The head is the first message that no seq has taken yet. After a
+          ;; timeout ended the seqs, a new call receives again.
+          ([] (let [{:keys [msgs end]} @cache
+                    i (count msgs)]
+                (when (= i end)
+                  (swap! cache assoc :end nil))
+                (cached-recv-seq transport response-timeout cache i)))
+          ([msg]
+           (transport/send transport msg)
+           (this)))
+        {::transport transport ::timeout response-timeout}))))
+
 (defn- delimited-transport-seq
   "Returns a function of one argument that performs described below.
    The following \"message\" is the argument of the function returned by this function.
@@ -56,7 +113,7 @@
   [klient termination-statuses delimited-slots]
   (let [delimited-keys (keys delimited-slots)
         termination-statuses (set termination-statuses)]
-    (with-meta
+    (#?(:clj with-meta :clje fn-with-meta)
       (fn [msg]
         (->> (klient (merge msg delimited-slots))
              (filter #(= delimited-slots (select-keys % delimited-keys)))
@@ -84,8 +141,9 @@
                                            (when clone
                                              (select-keys clone [:client-name :client-version :session])))))]
     (or (:new-session resp)
-        (throw (IllegalStateException.
-                (str "Could not open new session; :clone response: " resp))))))
+        (throw (#?(:clj IllegalStateException. :clje ex-info)
+                (str "Could not open new session; :clone response: " resp)
+                #?@(:clje [{}]))))))
 
 (defn client-session
   "Returns a function of one argument.  Accepts a message that is sent via the
@@ -143,8 +201,9 @@
     msg
     (try
       (assoc msg :value (read-string value))
-      (catch Exception e
-        (throw (IllegalStateException. (str "Could not read response value: " value) e))))))
+      (catch #?(:clj Exception :clje _) e
+        (throw (#?(:clj IllegalStateException. :clje ex-info)
+                (str "Could not read response value: " value) #?@(:clje [{}]) e))))))
 
 (defn response-values
   "Given a seq of responses (as from response-seq or returned from any function returned
@@ -159,7 +218,7 @@
 (defn- tls-connect
   [{:keys [port host transport-fn tls-keys-str tls-keys-file]}]
   (let [tls-context (tls/ssl-context-or-throw tls-keys-str tls-keys-file)]
-    (transport-fn (tls/socket tls-context ^String host (int port) 10000))))
+    (transport-fn (tls/socket tls-context ^#?(:clj String :clje erlang.Type) host (int port) 10000))))
 
 (defn connect
   "Connects to a socket-based REPL at the given host (defaults to 127.0.0.1) and port
@@ -181,18 +240,20 @@
     (tls-connect (assoc opts :transport-fn transport-fn :host host))
 
     (and host port)
-    (transport-fn (java.net.Socket. ^String host (int port)))
+    (transport-fn #?(:clj (java.net.Socket. ^String host (int port))
+                     :clje (beam-socket/tcp-client host port :infinity)))
 
     :else
-    (throw (IllegalArgumentException. "A host plus port or a socket must be supplied to connect."))))
+    (throw (#?(:clj IllegalArgumentException. :clje clojerl.BadArgumentError.)
+            "A host plus port or a socket must be supplied to connect."))))
 
-(defn- to-uri ^java.net.URI [x]
+(#?(:clj defn- :clje comment) to-uri ^java.net.URI [x]
   {:post [(instance? java.net.URI %)]}
   (if (string? x)
     (java.net.URI. x)
     x))
 
-(defn- socket-info
+(#?(:clj defn- :clje comment) socket-info
   [x]
   (let [uri (to-uri x)
         port (.getPort uri)]
@@ -200,7 +261,21 @@
            (when (pos? port)
              {:port port}))))
 
-(def ^{:private false} uri-scheme #(-> (to-uri %) .getScheme .toLowerCase))
+(#?(:clj def :clje comment) ^{:private false} uri-scheme #(-> (to-uri %) .getScheme .toLowerCase))
+
+;; The BEAM has no URI type. uri_string:parse returns a map instead.
+
+#?(:clje
+   (defn- socket-info
+     [x]
+     (let [uri (uri_string/parse x)
+           port (get uri :port)]
+       (merge {:host (get uri :host)}
+              (when (and port (pos? port))
+                {:port port})))))
+
+#?(:clje
+   (def ^{:private false} uri-scheme #(string/lowercase (get (uri_string/parse %) :scheme))))
 
 (defmulti url-connect
   "Connects to an nREPL endpoint identified by the given URL/URI.  Valid
@@ -219,7 +294,7 @@
   uri-scheme)
 
 ;; TODO: oh so ugly
-(defn- add-socket-connect-method!
+(#?(:clj defn- :clje comment) add-socket-connect-method!
   [protocol connect-defaults]
   (defmethod url-connect protocol
     [uri]
@@ -227,15 +302,38 @@
                            (merge connect-defaults
                                   (socket-info uri))))))
 
-(add-socket-connect-method! "nrepl+edn" {:transport-fn transport/edn
-                                         :port 7888})
-(add-socket-connect-method! "nrepl" {:transport-fn transport/bencode
-                                     :port 7888})
-(add-socket-connect-method! "telnet" {:transport-fn transport/tty})
+(#?(:clj add-socket-connect-method! :clje comment) "nrepl+edn" {:transport-fn transport/edn
+                                                                :port 7888})
+(#?(:clj add-socket-connect-method! :clje comment) "nrepl" {:transport-fn transport/bencode
+                                                            :port 7888})
+(#?(:clj add-socket-connect-method! :clje comment) "telnet" {:transport-fn transport/tty})
+
+;; A clojerl defmethod cannot close over locals, so each scheme gets its own.
+
+#?(:clje
+   (defmethod url-connect "nrepl+edn"
+     [uri]
+     (apply connect (mapcat identity
+                            (merge {:transport-fn transport/edn :port 7888}
+                                   (socket-info uri))))))
+
+#?(:clje
+   (defmethod url-connect "nrepl"
+     [uri]
+     (apply connect (mapcat identity
+                            (merge {:transport-fn transport/bencode :port 7888}
+                                   (socket-info uri))))))
+
+#?(:clje
+   (defmethod url-connect "telnet"
+     [uri]
+     (apply connect (mapcat identity
+                            (merge {:transport-fn transport/tty}
+                                   (socket-info uri))))))
 
 (defmethod url-connect :default
   [uri]
-  (throw (IllegalArgumentException.
+  (throw (#?(:clj IllegalArgumentException. :clje clojerl.BadArgumentError.)
           (format "No nREPL support known for scheme %s, url %s" (uri-scheme uri) uri))))
 
 (def ^{:deprecated "0.5.0"} version

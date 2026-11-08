@@ -5,28 +5,32 @@
   {:author "Chas Emerick"}
   (:refer-clojure :exclude [read])
   (:require
-   [clojure.java.io :as io]
+   #?(:clj [clojure.java.io :as io])
    clojure.main
    clojure.test
    [nrepl.middleware :refer [set-descriptor!]]
    [nrepl.middleware.caught :as caught]
    [nrepl.middleware.print :as print]
-   [nrepl.transport :as t])
-  (:import
-   (clojure.lang Compiler$CompilerException
-                 LineNumberingPushbackReader LispReader$ReaderException)
-   (java.io PushbackReader StringReader Writer)
-   (java.lang.reflect Field)))
+   [nrepl.transport :as t]
+   #?@(:clje [[nrepl.beam.bytes :as bytes]
+              [nrepl.beam.compat :as compat]
+              nrepl.in]))
+  #?(:clj
+     (:import
+      (clojure.lang Compiler$CompilerException
+                    LineNumberingPushbackReader LispReader$ReaderException)
+      (java.io PushbackReader StringReader Writer)
+      (java.lang.reflect Field))))
 
 (def ^:dynamic *msg*
   "The message currently being evaluated."
   nil)
 
-(defn- set-line!
+(#?(:clj defn- :clje comment) set-line!
   [^LineNumberingPushbackReader reader line]
   (-> reader (.setLineNumber line)))
 
-(defn- set-column!
+(#?(:clj defn- :clje comment) set-column!
   [^LineNumberingPushbackReader reader column]
   (when-let [field (->> LineNumberingPushbackReader
                         (.getDeclaredFields)
@@ -36,14 +40,26 @@
         (doto (.setAccessible true))
         (.set reader column))))
 
-(defn- source-logging-pushback-reader
+(#?(:clj defn- :clje comment) source-logging-pushback-reader
   [code line column]
   (let [reader (LineNumberingPushbackReader. (StringReader. code))]
     (when line (set-line! reader (int line)))
     (when column (set-column! reader (int column)))
     reader))
 
-(defn- interrupted?
+#?(:clje
+   (defn- source-logging-pushback-reader
+     "Return a reader over `code` that reports positions from `line` and
+  `column`. clojerl readers always start at line 1 and column 1, so the
+  code gets that many newlines and spaces in front."
+     [code line column]
+     (bytes/char-reader
+      (bytes/binary-input
+       (str (apply str (repeat (dec (or line 1)) "\n"))
+            (apply str (repeat (dec (or column 1)) " "))
+            code)))))
+
+(#?(:clj defn- :clje comment) interrupted?
   "Returns true if the given throwable was ultimately caused by an interrupt."
   [^Throwable e]
   (or (instance? ThreadDeath (clojure.main/root-cause e))
@@ -51,10 +67,10 @@
            (instance? ThreadDeath (.getCause e)))))
 
 (defn- short-file-name [source-path]
-  (try (.getName (io/file source-path))
-       (catch Exception _)))
+  (try #?(:clj (.getName (io/file source-path)) :clje (filename/basename source-path))
+       (catch #?(:clj Exception :clje _) _)))
 
-(defn- skip-stdin-newline []
+(#?(:clj defn- :clje comment) skip-stdin-newline []
   ;; NB: confusing hack. When `(read)` is issued to an input stream, it
   ;; returns a Lisp form, ending with the last character of the form,
   ;; naturally (e.g. a closing paren). However, it is expected that any
@@ -69,7 +85,17 @@
              (.ready ^LineNumberingPushbackReader *in*))
     (clojure.main/skip-if-eol *in*)))
 
-(defn evaluator
+#?(:clje
+   (defn- skip-stdin-newline []
+     ;; The same hack as the JVM version. clojure.main/skip-if-eol needs an
+     ;; erlang.io.PushbackReader, so this does the same with the session reader.
+     (when (and (instance? nrepl.in.QueuePollingReader *in*)
+                (nrepl.in/ready? *in*))
+       (let [c (erlang.io.IReader/read *in*)]
+         (when-not (or (= "\n" c) (= :eof c))
+           (erlang.io.IPushbackReader/unread *in* c))))))
+
+(#?(:clj defn :clje comment) evaluator
   "Return a closure that evaluates msg's `:code` (either a string or a seq of
   forms to be evaluated) within the dynamic context of its session. `:ns` can be
   optionally specified (resolved via `find-ns`). The message MUST contain a
@@ -178,6 +204,111 @@
             (catch Exception _))
           (pop-thread-bindings))))))
 
+#?(:clje
+   (defn- run-catching
+     "Call `f`. If it throws, call `on-error` with the Erlang class of the
+  error (`:error`, `:throw` or `:exit`), the error and its stack trace."
+     [f on-error]
+     (try
+       (f)
+       (catch :throw e :stack st (on-error :throw e st))
+       (catch :exit e :stack st (on-error :exit e st))
+       (catch _ e :stack st (on-error :error e st)))))
+
+#?(:clje
+   (defn evaluator
+     "Return a closure that evaluates msg's `:code` (either a string or a seq of
+  forms to be evaluated) within the dynamic context of its session. `:ns` can be
+  optionally specified (resolved via `find-ns`). The message MUST contain a
+  Transport implementation in :transport; expression results and errors will be
+  sent via that Transport."
+     [msg]
+     (fn run []
+       (let [{:keys [eval ns code file line column]} msg
+             read-fn (or (::read-fn msg) clojure.core/read)
+             eval-fn (or (::eval-fn msg) (some-> eval symbol find-var))
+             stop-on-error? (::stop-on-error msg)
+             bindings (or (::bindings msg) {})
+             explicit-ns (some-> ns symbol find-ns)
+             eof (erlang/make_ref)
+             errored? (process-val! false)
+             read-cond (keyword (:read-cond msg :allow))
+             read-opts (cond-> {:read-cond read-cond :eof eof}
+                         file (assoc :file file))
+             read (cond (string? code)
+                        (let [reader (source-logging-pushback-reader code line column)]
+                          #(read-fn read-opts reader))
+
+                        ;; Special case, only used for TTY transport.
+                        (satisfies? erlang.io.IPushbackReader code)
+                        (let [already-read? (process-val! false)]
+                          ;; For TTY, only allow one read per eval, then
+                          ;; return EOF.
+                          #(if @already-read?
+                             eof
+                             (do (vreset! already-read? true)
+                                 (read-fn read-opts code))))
+
+                        (sequential? code)
+                        (let [code (process-val! (seq code))]
+                          #(if-let [s @code]
+                             (do (vreset! code (next s))
+                                 (first s))
+                             eof)))
+             caught (fn [kind e stacktrace]
+                      (set! *e e)
+                      (set! *stacktrace stacktrace)
+                      (vreset! errored? true)
+                      ;; An interrupt kills the process, so there is no
+                      ;; interrupted error to filter out here.
+                      (t/respond-to msg {::caught/throwable e
+                                         :status #{:eval-error}
+                                         :ex (str "class " (compat/error-name kind e))
+                                         :root-ex (str "class " (compat/error-name kind (compat/root-cause e)))}))]
+         (push-thread-bindings (merge (when explicit-ns {#'*ns* explicit-ns})
+                                      bindings))
+         (compat/restore-ns-mappings! *ns*)
+         (try
+           (loop []
+             (let [input (run-catching
+                          #(clojure.main/with-read-known (read))
+                          (fn [kind e st]
+                            ;; If error happens during read phase, call
+                            ;; caught-hook but don't continue executing.
+                            (caught kind (ex-info nil {:clojure.error/phase :read-source} e) st)
+                            eof))]
+               (when-not (= input eof)
+                 (run-catching
+                  #(let [value (if eval-fn (eval-fn input) (clojure.core/eval input))]
+                     (set! *3 *2)
+                     (set! *2 *1)
+                     (set! *1 value)
+                     (run-catching
+                      (fn []
+                        (erlang.io.IWriter/write *err* "")
+                        (erlang.io.IWriter/write *out* "")
+                        (t/respond-to msg {:ns (str (ns-name *ns*))
+                                           :value value
+                                           ::print/keys #{:value}}))
+                      (fn [_kind e _st]
+                        (throw (ex-info nil {:clojure.error/phase :print-eval-result} e)))))
+                  caught)
+                 ;; Otherwise, when errors happen during eval/print phase,
+                 ;; report the exception but continue executing the
+                 ;; remaining readable forms, unless we load the whole file.
+                 (when-not (and stop-on-error? @errored?)
+                   (recur)))))
+           (finally
+             ;; The evaluated code may have closed *out* or *in* (e.g. `(slurp
+             ;; *in*)`). An exception escaping from here would kill the session
+             ;; process, and the client would never see `done`.
+             (try
+               (flush)
+               (skip-stdin-newline)
+               (catch _ _))
+             (.destroy errored?)
+             (pop-thread-bindings)))))))
+
 (defn interruptible-eval
   "Evaluation middleware that supports interrupts.  Returns a handler that supports
    \"eval\" and \"interrupt\" :op-erations that delegates to the given handler
@@ -189,8 +320,10 @@
         (cond (nil? code)
               (t/respond-to msg :status #{:error :no-code :done})
 
-              (not (or (string? code) (instance? Iterable code)
-                       (instance? PushbackReader code)))
+              (not (or (string? code)
+                       #?(:clj (instance? Iterable code) :clje (sequential? code))
+                       #?(:clj (instance? PushbackReader code)
+                          :clje (satisfies? erlang.io.IPushbackReader code))))
               (t/respond-to msg :status #{:error :unknown-code-type :done})
 
               (and (some? ns) (nil? (some-> ns symbol find-ns)))

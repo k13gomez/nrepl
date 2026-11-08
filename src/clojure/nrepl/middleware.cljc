@@ -7,11 +7,12 @@
   to their `:requires` and `:expects` constraints. Also includes
   the built-in `wrap-describe` middleware."
   {:added "0.4"}
-  (:refer-clojure :exclude [comparator])
+  (:refer-clojure :exclude [comparator #?@(:clje [format])])
   (:require
    [nrepl.misc :as misc]
    [nrepl.transport :as t :refer [safe-handle]]
-   [nrepl.version :as version]))
+   [nrepl.version :as version]
+   #?@(:clje [[nrepl.beam.compat :refer [descriptor-of format register-descriptor!]]])))
 
 ;; Registering dynvars that are used to configure middleware. This lives here
 ;; and not in nrepl.middleware.session to avoid circular dependencies.
@@ -22,10 +23,11 @@
   (atom #{}))
 
 (defn- var-name
-  [^clojure.lang.Var v]
-  (str (.ns v) \/ (.sym v)))
+  [^#?(:clj clojure.lang.Var :clje clojerl.Var) v]
+  #?(:clj (str (.ns v) \/ (.sym v))
+     :clje (let [m (meta v)] (str (:ns m) \/ (:name m)))))
 
-(defn set-descriptor!
+(defn #?(:clj set-descriptor! :clje set-descriptor-fn)
   "Sets the given [descriptor] map as the ::descriptor metadata on the
   provided [middleware-var], after assoc'ing in the var's fully-qualified name
   as the descriptor's \"implemented-by\" value. The value of `:session-dynvars`
@@ -35,20 +37,49 @@
   (let [descriptor (assoc descriptor
                           :implemented-by (-> middleware-var var-name symbol))]
     (swap! per-session-dynvars into (:session-dynvars descriptor))
-    (alter-meta! middleware-var assoc ::descriptor descriptor)))
+    #?(:clj (alter-meta! middleware-var assoc ::descriptor descriptor)
+       :clje (register-descriptor! middleware-var descriptor))))
+
+#?(:clje
+   (defmacro set-descriptor!
+     "Sets the given [descriptor] map as the descriptor of the provided
+  [middleware-var], like the JVM function. An AOT-compiled namespace does
+  not run its top-level calls at load, but it runs `erl-on-load*`, so this
+  macro registers the descriptor both now and when the module loads.
+
+  clojerl cannot call its own module from `on_load`. So in this namespace
+  the descriptor goes straight into `nrepl.beam.compat`."
+     [middleware-var descriptor]
+     (if (= 'nrepl.middleware (ns-name *ns*))
+       (let [[_ sym] middleware-var]
+         `(do (set-descriptor-fn ~middleware-var ~descriptor)
+              (erl-on-load*
+               (register-descriptor! ~middleware-var
+                                     (assoc ~descriptor :implemented-by '~(symbol (str *ns*) (str sym)))))))
+       `(do (nrepl.middleware/set-descriptor-fn ~middleware-var ~descriptor)
+            (erl-on-load* (nrepl.middleware/set-descriptor-fn ~middleware-var ~descriptor))))))
 
 (defn- safe-version
   [m]
   (into {} (filter (fn [[_ v]] (or (number? v) (string? v))) m)))
 
-(defn- java-version
+(#?(:clj defn- :clje comment) java-version
   []
   {:major misc/java-version
    :version-string (System/getProperty "java.version")})
 
+#?(:clje
+   (defn- erlang-version
+     "Return the OTP release and the ERTS version of the running VM."
+     []
+     (let [otp (erlang/list_to_binary (erlang/system_info :otp_release))]
+       {:major (erlang/binary_to_integer otp)
+        :version-string otp
+        :erts-version-string (erlang/list_to_binary (erlang/system_info :version))})))
+
 (defn- describe-reply
   [{:keys [verbose?] :as msg} middleware]
-  (let [descriptors (mapv (comp ::descriptor meta) middleware)
+  (let [descriptors (mapv #?(:clj (comp ::descriptor meta) :clje descriptor-of) middleware)
         ops (let [ops (apply merge (map :handles descriptors))]
               (if verbose?
                 ops
@@ -64,7 +95,8 @@
       :versions {:nrepl (safe-version version/version)
                  :clojure (safe-version
                            (assoc *clojure-version* :version-string (clojure-version)))
-                 :java (safe-version (java-version))}
+                 #?@(:clj [:java (safe-version (java-version))]
+                     :clje [:erlang (safe-version (erlang-version))])}
       :status :done}
      (when aux {:aux aux}))))
 
@@ -113,7 +145,7 @@
   (let [mware-set (set middlewares)]
     (into []
           (comp (mapcat (fn [m]
-                          (let [{:keys [expects requires] :as desc} (::descriptor (meta m))]
+                          (let [{:keys [expects requires] :as desc} #?(:clj (::descriptor (meta m)) :clje (descriptor-of m))]
                             (when (nil? desc)
                               (misc/log :warning "No nREPL middleware descriptor in metadata of" m
                                         ", see nrepl.middleware/set-descriptor!"))
@@ -126,7 +158,7 @@
                               (into [m] missing-deps)))))
                 (distinct)
                 (map (fn [m]
-                       (let [desc (::descriptor (meta m))]
+                       (let [desc #?(:clj (::descriptor (meta m)) :clje (descriptor-of m))]
                          (-> desc
                              ;; Conj the middleware Var itself to `:handles` to support direct
                              ;; reference to middlewares dependencies in `:expects`/`:requires`.

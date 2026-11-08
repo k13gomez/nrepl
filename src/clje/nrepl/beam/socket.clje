@@ -1,0 +1,251 @@
+(ns nrepl.beam.socket
+  "Socket types for the BEAM. They wrap `gen_tcp` and `ssl` sockets and
+  take the place of the JVM `ServerSocket`, `Socket` and stream classes.
+
+  A connection is a byte input and a byte output (see `nrepl.beam.bytes`).
+  Its read buffer lives in the dictionary of the process that reads, so
+  only one process may read from a connection."
+  (:require [nrepl.beam.bytes :as bytes]))
+
+(def ^:private disconnect-reasons
+  "Socket error reasons that mean the peer is gone."
+  #{:closed :enotconn :econnreset :epipe :etimedout})
+
+(defn socket-error
+  "Return the error for the socket error `reason`."
+  [reason]
+  (ex-info (str "Socket error: " (pr-str reason)) {::reason reason}))
+
+(defn disconnected?
+  "Return true if the error `e` means that the peer is gone."
+  [e]
+  (contains? disconnect-reasons (::reason (ex-data e))))
+
+(defn unwrap
+  "Return the value of the Erlang result `r`. Return nil for `ok`. Throw
+  a socket error for `{error, Reason}`."
+  [r]
+  (cond
+    (= :ok r) nil
+    (and (erlang/is_tuple r) (= :ok (erlang/element 1 r))) (erlang/element 2 r)
+    (and (erlang/is_tuple r) (= :error (erlang/element 1 r))) (throw (socket-error (erlang/element 2 r)))
+    :else r))
+
+(defn- recv* [mod sock]
+  (case mod
+    :gen_tcp (gen_tcp/recv sock 0)
+    :ssl (ssl/recv sock 0)))
+
+(defn- send* [mod sock data]
+  (case mod
+    :gen_tcp (gen_tcp/send sock data)
+    :ssl (ssl/send sock data)))
+
+(defn- close* [mod sock]
+  (case mod
+    :gen_tcp (gen_tcp/close sock)
+    :ssl (ssl/close sock)))
+
+(defn- buffer-key [sock]
+  #erl[::buffer sock])
+
+(defn- fill
+  "Return the read buffer of `sock` in this process. Receive more bytes when
+  the buffer is empty. Return nil at the end of the input."
+  [mod sock]
+  (let [k (buffer-key sock)
+        buf (erlang/get k)]
+    (if (and buf (pos? (erlang/byte_size buf)))
+      buf
+      (let [r (recv* mod sock)]
+        (cond
+          (and (erlang/is_tuple r) (= :ok (erlang/element 1 r)))
+          (do (erlang/put k (erlang/element 2 r))
+              (erlang/element 2 r))
+
+          (= #erl[:error :closed] r)
+          nil
+
+          :else
+          (throw (socket-error (erlang/element 2 r))))))))
+
+(deftype Connection [mod sock]
+  bytes/ByteInput
+  (read-byte [_]
+    (if-let [buf (fill mod sock)]
+      (do (erlang/put (buffer-key sock)
+                      (erlang/binary_part buf 1 (dec (erlang/byte_size buf))))
+          (binary/at buf 0))
+      -1))
+  (read-bytes [_ n]
+    (loop [acc []
+           need n]
+      (let [buf (when (pos? need) (fill mod sock))]
+        (if-not buf
+          (erlang/iolist_to_binary (clj_rt/to_list acc))
+          (let [size (erlang/byte_size buf)
+                k (min need size)]
+            (erlang/put (buffer-key sock) (erlang/binary_part buf k (- size k)))
+            (recur (conj acc (erlang/binary_part buf 0 k)) (- need k)))))))
+  (unread [_ b]
+    (let [k (buffer-key sock)]
+      (erlang/put k (erlang/iolist_to_binary #erl(b (or (erlang/get k) ""))))))
+
+  bytes/ByteOutput
+  (write [this data]
+    (unwrap (send* mod sock data))
+    this)
+
+  erlang.io.ICloseable
+  (close [_]
+    (close* mod sock)
+    nil)
+
+  clojerl.IStringable
+  (str [_] (str "#<nrepl.beam.socket.Connection " (pr-str sock) ">")))
+
+(deftype ServerSocket [mod lsock path owner ssl-opts]
+  erlang.io.ICloseable
+  (close [_]
+    (close* mod lsock)
+    (erlang/send owner :stop)
+    (when path (file/delete path))
+    nil)
+
+  clojerl.IStringable
+  (str [_] (str "#<nrepl.beam.socket.ServerSocket " (pr-str lsock) ">")))
+
+(defn- in-owner
+  "Run `open` in a new process that owns the socket it returns. The process
+  lives until the socket closes, so the socket does not depend on the
+  lifetime of the caller. Return the socket."
+  [open]
+  (let [parent (erlang/self)
+        ref (erlang/make_ref)
+        owner (erlang/spawn
+               (fn []
+                 (let [r (open)]
+                   (erlang/send parent #erl[ref r])
+                   (when (= :ok (erlang/element 1 r))
+                     (receive* :stop :ok)))))]
+    [(unwrap (receive* #erl[ref r] r)) owner]))
+
+(defn- parse-address [host]
+  (let [h (erlang/binary_to_list host)
+        r (inet/parse_address h)]
+    (if (= :ok (erlang/element 1 r))
+      (erlang/element 2 r)
+      (unwrap (inet/getaddr h :inet)))))
+
+(def ^:private tcp-options
+  "Options for a connected TCP socket. The read side is passive."
+  #erl(:binary #erl[:active false] #erl[:packet :raw]))
+
+(defn tcp-server-socket
+  "Return a TCP server socket bound to `host` and `port`. Port 0 picks a
+  free port."
+  [host port]
+  (let [ip (parse-address host)
+        opts (lists/append tcp-options
+                           #erl(#erl[:ip ip] #erl[:reuseaddr true] #erl[:nodelay true]))
+        [lsock owner] (in-owner #(gen_tcp/listen port opts))]
+    (ServerSocket. :gen_tcp lsock nil owner nil)))
+
+(defn unix-server-socket
+  "Return a server socket bound to the filesystem path `path`."
+  [path]
+  (let [opts (lists/append tcp-options #erl(#erl[:ifaddr #erl[:local path]]))
+        [lsock owner] (in-owner #(gen_tcp/listen 0 opts))]
+    (ServerSocket. :gen_tcp lsock path owner nil)))
+
+(defn tls-server-socket
+  "Return a TLS server socket bound to `host` and `port`, with the ssl
+  options `ssl-opts`."
+  [ssl-opts host port]
+  (unwrap (application/ensure_all_started :ssl))
+  (let [ip (parse-address host)
+        opts (lists/append tcp-options
+                           (lists/append #erl(#erl[:ip ip] #erl[:reuseaddr true] #erl[:nodelay true])
+                                         ssl-opts))
+        [lsock owner] (in-owner #(ssl/listen port opts))]
+    (ServerSocket. :ssl lsock nil owner ssl-opts)))
+
+(defn local-port
+  "Return the port that the server socket `s` listens on."
+  [^ServerSocket s]
+  (let [r (case (.-mod s)
+            :gen_tcp (inet/port (.-lsock s))
+            :ssl (ssl/sockname (.-lsock s)))]
+    (if (= :gen_tcp (.-mod s))
+      (unwrap r)
+      (erlang/element 2 (unwrap r)))))
+
+(defn tls?
+  "Return true if `s` is a TLS server socket."
+  [^ServerSocket s]
+  (= :ssl (.-mod s)))
+
+(defn ssl-options
+  "Return the ssl options of the TLS server socket `s`."
+  [^ServerSocket s]
+  (.-ssl-opts s))
+
+(defn unix-path
+  "Return the filesystem path of the server socket `s`, or nil."
+  [^ServerSocket s]
+  (.-path s))
+
+(defn accept
+  "Accept a connection on the TCP server socket `s`. Throw a socket error
+  with reason `closed` if `s` is closed."
+  [^ServerSocket s]
+  (Connection. :gen_tcp (unwrap (gen_tcp/accept (.-lsock s)))))
+
+(defn tls-accept
+  "Accept a TLS connection on `s` and run its handshake. Wait up to
+  `timeout-ms` for the handshake. Return the connection."
+  [^ServerSocket s timeout-ms]
+  (let [t (unwrap (ssl/transport_accept (.-lsock s)))]
+    (try
+      (Connection. :ssl (unwrap (ssl/handshake t timeout-ms)))
+      (catch _ e
+        (ssl/close t)
+        (throw e)))))
+
+(defn peer-cert
+  "Return the DER certificate of the peer of the TLS connection `c`."
+  [^Connection c]
+  (unwrap (ssl/peercert (.-sock c))))
+
+(defn tcp-client
+  "Connect to `host` and `port`. Wait up to `timeout-ms`, or forever if it
+  is `:infinity`. Return the connection."
+  [host port timeout-ms]
+  (Connection. :gen_tcp
+               (unwrap (gen_tcp/connect (parse-address host) port
+                                        (lists/append tcp-options #erl(#erl[:nodelay true]))
+                                        timeout-ms))))
+
+(defn unix-client
+  "Connect to the filesystem socket at `path`. Return the connection."
+  [path]
+  (Connection. :gen_tcp
+               (unwrap (gen_tcp/connect #erl[:local path] 0 tcp-options))))
+
+(defn tls-client
+  "Connect with TLS to `host` and `port`, with the ssl options `ssl-opts`.
+  Return the connection."
+  [ssl-opts host port timeout-ms]
+  (unwrap (application/ensure_all_started :ssl))
+  (Connection. :ssl
+               (unwrap (ssl/connect (parse-address host) port
+                                    (lists/append tcp-options ssl-opts)
+                                    timeout-ms))))
+
+(defn connected?
+  "Return true if the connection `c` is still open."
+  [^Connection c]
+  (let [r (case (.-mod c)
+            :gen_tcp (inet/peername (.-sock c))
+            :ssl (ssl/peername (.-sock c)))]
+    (= :ok (erlang/element 1 r))))
