@@ -1,4 +1,4 @@
-.PHONY: test eastwood cljfmt kondo cloverage install deploy clean lint javac javac-test docs verify-docs verify-cljdoc check-env check-release-tag
+.PHONY: test eastwood cljfmt kondo cloverage install deploy clean lint javac javac-test docs verify-docs verify-cljdoc check-env check-release-tag clje-compile clje-test
 .DEFAULT_GOAL := install
 
 # Set bash instead of sh for the @if [[ conditions,
@@ -17,6 +17,14 @@ javac-test:
 
 test: javac-test
 	clojure -M:$(CLOJURE_VERSION):dev:test$(EXTRA_ALIASES)
+
+# BEAM build for clojerl. Set CLJE_NS to test one namespace, for example
+# CLJE_NS=nrepl.bencode-test make clje-test.
+clje-compile:
+	rebar3 as test clojerl compile
+
+clje-test:
+	rebar3 as test clojerl test $(if $(CLJE_NS),--ns $(CLJE_NS))
 
 eastwood: javac-test
 	clojure -M:eastwood:+junixsocket

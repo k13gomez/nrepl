@@ -1,4 +1,6 @@
-{:cljdoc.doc/tree
+;; The .cljc sources also build for clojerl. cljdoc analyzes only the JVM side.
+{:cljdoc/languages ["clj"]
+ :cljdoc.doc/tree
  [["Readme" {:file "README.md"}]
   ["Changelog" {:file "CHANGELOG.md"}]
   ["Home" {:file "doc/modules/ROOT/pages/index.adoc"}]

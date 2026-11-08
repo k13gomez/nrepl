@@ -1,0 +1,63 @@
+(ns nrepl.beam.compat
+  "BEAM versions of JVM helpers that nREPL calls in many places.
+  A shared namespace refers these names on clje only, so its call sites
+  stay the same as on the JVM."
+  (:refer-clojure :exclude [format])
+  (:require [clojure.string :as str]))
+
+(defn format
+  "Format `fmt` with `args` like the JVM `clojure.core/format`.
+  It supports only the directives that nREPL uses: `%s`, `%d` and `%%`.
+  clojerl `format` takes Erlang `io_lib` directives instead."
+  [fmt & args]
+  (loop [tokens (re-seq #"%[sd%]|[^%]+|%" fmt)
+         args args
+         acc []]
+    (if-let [[token & tokens] (seq tokens)]
+      (case token
+        ("%s" "%d") (recur tokens (rest args) (conj acc (str (first args))))
+        "%%" (recur tokens args (conj acc "%"))
+        (recur tokens args (conj acc token)))
+      (str/join acc))))
+
+;; clojerl has no transients. These versions return persistent
+;; collections. Code that uses the return values works the same.
+
+(defn transient
+  "Return `coll`. clojerl has no transient collections."
+  [coll]
+  coll)
+
+(defn persistent!
+  "Return `coll`. clojerl has no transient collections."
+  [coll]
+  coll)
+
+(defn conj!
+  "Same as `conj`. clojerl has no transient collections."
+  [coll x]
+  (conj coll x))
+
+(defn assoc!
+  "Same as `assoc`. clojerl has no transient collections."
+  [m k v]
+  (assoc m k v))
+
+(defn throwable?
+  "Return true if `x` is a clojerl error value."
+  [x]
+  (satisfies? clojerl.IError x))
+
+(defn getenv
+  "Return the value of the environment variable `k` as a string.
+  Return nil if the variable is not set."
+  [k]
+  (let [v (os/getenv (erlang/binary_to_list k))]
+    (when (erlang/is_list v)
+      (erlang/list_to_binary v))))
+
+(defn home-dir
+  "Return the home directory of the user that runs the VM."
+  []
+  (let [[[dir]] (erlang/element 2 (init/get_argument :home))]
+    (erlang/list_to_binary dir)))

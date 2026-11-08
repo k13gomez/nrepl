@@ -3,21 +3,31 @@
   at build time."
   {:author "Colin Jones"
    :added  "0.5"}
-  (:require [clojure.java.io :as io])
-  (:import java.util.Properties))
+  #?(:clj (:require [clojure.java.io :as io]))
+  #?(:clj (:import java.util.Properties)))
 
 (def ^:private group "nrepl")
 (def ^:private artifact "nrepl")
 (def ^:private properties-filename
   (str "META-INF/maven/" group "/" artifact "/pom.properties"))
 
-(defn- map-from-property-filepath [file]
+(#?(:clj defn- :clje comment) map-from-property-filepath [file]
   (try
     (with-open [rdr (io/reader (io/resource file))]
       (let [props (Properties.)]
         (.load props rdr)
         (into {} props)))
     (catch Exception _e nil)))
+
+#?(:clje
+   (defn- app-vsn
+     "Return the vsn of the nrepl application, or nil if it is not on the
+  code path. The BEAM build reads it at compile time."
+     []
+     (application/load :nrepl)
+     (let [r (application/get_key :nrepl :vsn)]
+       (when (erlang/is_tuple r)
+         (erlang/list_to_binary (erlang/element 2 r))))))
 
 (defn- get-version
   "Attempts to get the project version from system properties, or a properties
@@ -26,8 +36,8 @@
   present."
   ([] (get-version ""))
   ([default-version]
-   (or (System/getProperty (str artifact ".version"))
-       (get (map-from-property-filepath properties-filename) "version")
+   (or #?(:clj (System/getProperty (str artifact ".version")) :clje (app-vsn))
+       #?(:clj (get (map-from-property-filepath properties-filename) "version"))
        default-version)))
 
 (def ^:private version-string
@@ -41,6 +51,7 @@
   (assoc (->> version-string
               (re-find #"(\d+)\.(\d+)\.(\d+)-?(.*)")
               rest
-              (map #(try (Integer/parseInt %) (catch Exception _e nil)))
+              (map #(try #?(:clj (Integer/parseInt %) :clje (erlang/binary_to_integer %))
+                         (catch #?(:clj Exception :clje _) _e nil)))
               (zipmap [:major :minor :incremental :qualifier]))
          :version-string version-string))

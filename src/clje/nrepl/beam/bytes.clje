@@ -1,0 +1,68 @@
+(ns nrepl.beam.bytes
+  "Byte streams for the BEAM. They take the place of the JVM
+  `PushbackInputStream` and `OutputStream` that `nrepl.bencode` uses.
+
+  A binary input keeps its buffer in a process-val. Only the process
+  that made the input can read from it.")
+
+(defprotocol ByteInput
+  "A source of bytes with a pushback buffer."
+  (read-byte [input]
+    "Return the next byte as an integer from 0 to 255.
+  Return -1 at the end of the input.")
+  (read-bytes [input n]
+    "Return a binary with the next `n` bytes.
+  The binary is shorter than `n` bytes at the end of the input.")
+  (unread [input b]
+    "Push the byte `b` back, so that the next read returns it first."))
+
+(defprotocol ByteOutput
+  "A sink of bytes."
+  (write [output data]
+    "Write `data` to `output`. The data is a binary, a string or an
+  iolist. Return `output`."))
+
+(deftype BinaryInput [buf]
+  ByteInput
+  (read-byte [_]
+    (let [b @buf]
+      (if (zero? (erlang/byte_size b))
+        -1
+        (do (vreset! buf (erlang/binary_part b 1 (dec (erlang/byte_size b))))
+            (binary/at b 0)))))
+  (read-bytes [_ n]
+    (let [b @buf
+          size (erlang/byte_size b)
+          n (min n size)]
+      (vreset! buf (erlang/binary_part b n (- size n)))
+      (erlang/binary_part b 0 n)))
+  (unread [_ b]
+    (vreset! buf (erlang/iolist_to_binary #erl(b @buf))))
+
+  clojerl.IStringable
+  (str [_] "#<nrepl.beam.bytes.BinaryInput>"))
+
+(deftype BinaryOutput [acc]
+  ByteOutput
+  (write [this data]
+    (vreset! acc #erl(@acc data))
+    this)
+
+  clojerl.IStringable
+  (str [_] "#<nrepl.beam.bytes.BinaryOutput>"))
+
+(defn binary-input
+  "Return a byte input that reads the binary `b`."
+  [b]
+  (BinaryInput. (process-val! b)))
+
+(defn binary-output
+  "Return a byte output that collects what it gets in memory.
+  Call `output->binary` to get the bytes."
+  []
+  (BinaryOutput. (process-val! #erl())))
+
+(defn output->binary
+  "Return the bytes that `output` collected, as one binary."
+  [^BinaryOutput output]
+  (erlang/iolist_to_binary @(.-acc output)))

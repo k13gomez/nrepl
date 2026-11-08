@@ -1,4 +1,5 @@
-{:extra-indents {run-with [[:inner 0]]
+{:file-pattern #re "\\.clj[csxe]?$"
+ :extra-indents {run-with [[:inner 0]]
                  testing-print [[:inner 0]]
                  safe-handle [[:inner 0]]
                  rethrow-on-disconnection [[:inner 0]]}}

@@ -9,14 +9,18 @@
 (ns nrepl.bencode
   "A netstring and bencode implementation for Clojure."
   {:author "Meikel Brandmeyer"}
-  (:require
-   [clojure.java.io :as io])
-  (:import
-   (clojure.lang IPersistentCollection IPersistentMap Named PersistentVector)
-   (java.io ByteArrayOutputStream EOFException InputStream IOException
-            OutputStream PushbackInputStream)
-   (java.nio.charset StandardCharsets)
-   (java.util Arrays)))
+  #?(:clj (:require
+           [clojure.java.io :as io])
+     :clje (:refer-clojure :exclude [format]))
+  #?(:clj (:import
+           (clojure.lang IPersistentCollection IPersistentMap Named PersistentVector)
+           (java.io ByteArrayOutputStream EOFException InputStream IOException
+                    OutputStream PushbackInputStream)
+           (java.nio.charset StandardCharsets)
+           (java.util Arrays))
+     :clje (:require
+            [nrepl.beam.bytes :as bytes]
+            [nrepl.beam.compat :refer [assoc! conj! format persistent! transient]])))
 
 ;; # Motivation
 ;;
@@ -79,12 +83,19 @@
 (def ^:const minus 45)
 (def ^:const colon 58)
 
+#?(:clje
+   (defn- eof-error
+     "Return the error for an unexpected end of input. The BEAM has no
+  `EOFException`, so the ex-data carries `::eof` instead."
+     [msg]
+     (ex-info msg {::eof true})))
+
 (defn- throw-eof []
-  (throw (EOFException. "Invalid netstring. Unexpected end of input.")))
+  (throw (#?(:clj EOFException. :clje eof-error) "Invalid netstring. Unexpected end of input.")))
 
 ;; This function is inline because it is used in a hot loop inside `read-long`.
 
-(definline ^:private read-byte [input]
+(#?(:clj definline :clje comment) ^:private read-byte [input]
   ;; There is a quirk here. `.read` returns -1 on end of input. However, the
   ;; Java `byte` has a range from -128 to 127. To accommodate for that, Java
   ;; uses `Byte/toUnsignedInt` which offsets the byte value by 256. The result
@@ -96,7 +107,13 @@
      ;; Cast back to int to avoid boxing and/or redundant casts for consumers.
      (unchecked-int (unchecked-byte c#))))
 
-(defn- read-bytes ^bytes [^InputStream input, ^long n]
+#?(:clje
+   (defn- read-byte [input]
+     (let [c (bytes/read-byte input)]
+       (when (neg? c) (throw-eof))
+       c)))
+
+(#?(:clj defn- :clje comment) read-bytes ^bytes [^InputStream input, ^long n]
   (let [content (byte-array n)]
     (loop [offset 0, len n]
       (let [result (.read input content (unchecked-int offset)
@@ -109,16 +126,23 @@
           (recur (unchecked-add offset result) (unchecked-subtract len result)))))
     content))
 
+#?(:clje
+   (defn- read-bytes [input n]
+     (let [content (bytes/read-bytes input n)]
+       (when (< (erlang/byte_size content) n)
+         (throw (eof-error "Invalid netstring. Less data available than expected.")))
+       content)))
+
 ;; `read-long` is used for reading integers from the stream as well
 ;; as the byte count prefixes of byte strings. The delimiter is \:
 ;; for byte count prefixes and \e for integers.
 
-(defn- read-long ^long [^PushbackInputStream input, ^long delim]
+(defn- read-long ^#?(:clj long :clje erlang.Type) [^#?(:clj PushbackInputStream :clje erlang.Type) input, ^#?(:clj long :clje erlang.Type) delim]
   (let [first-byte (read-byte input)
         ;; Only the first byte can be a minus.
         negate? (if (= first-byte minus)
                   true
-                  (do (.unread input first-byte)
+                  (do (#?(:clj .unread :clje bytes/unread) input first-byte)
                       false))]
     (loop [n 0]
       ;; We read repeatedly a byte from the input...
@@ -156,21 +180,27 @@
 (defn read-netstring
   "Reads a classic netstring from input—an InputStream. Returns the
   contained binary data as byte array."
-  ^bytes [input]
+  ^#?(:clj bytes :clje erlang.Type) [input]
   (let [content (read-netstring* input)]
     (when-not (= (read-byte input) comma)
-      (throw (IOException. "Invalid netstring. ',' expected.")))
+      (throw (#?(:clj IOException. :clje ex-info) "Invalid netstring. ',' expected." #?@(:clje [{}]))))
     content))
 
 ;; Similarly the `string>payload` and `string<payload` functions
 ;; are defined as follows to simplify the conversion between strings
 ;; and byte arrays in various parts of the code.
 
-(defn- string>payload ^bytes [^String s]
+(#?(:clj defn- :clje comment) string>payload ^bytes [^String s]
   (.getBytes s StandardCharsets/UTF_8))
 
-(defn- string<payload ^String [^bytes b]
+(#?(:clj defn- :clje comment) string<payload ^String [^bytes b]
   (String. b StandardCharsets/UTF_8))
+
+;; On the BEAM a string is a UTF-8 binary, so both conversions are identity.
+
+#?(:clje (defn- string>payload [s] s))
+
+#?(:clje (defn- string<payload [b] b))
 
 ;; ## Writing a netstring
 ;;
@@ -183,19 +213,24 @@
 ;; Similar to `read-netstring` we also split `write-netstring` into
 ;; the entry point itself and a helper function.
 
-(defn- write-netstring* [^OutputStream output, ^bytes content]
+(#?(:clj defn- :clje comment) write-netstring* [^OutputStream output, ^bytes content]
   (doto output
     (.write (string>payload (str (alength content))))
     (.write (unchecked-int colon))
     (.write content)))
 
+#?(:clje
+   (defn- write-netstring* [output content]
+     (bytes/write output #erl((str (erlang/byte_size content)) ":" content))))
+
 (defn write-netstring
   "Write the given binary data to the output stream in form of a classic
   netstring."
-  [^OutputStream output, content]
+  [^#?(:clj OutputStream :clje erlang.Type) output, content]
   (doto output
     (write-netstring* content)
-    (.write (unchecked-int comma))))
+    #?(:clj (.write (unchecked-int comma))
+       :clje (bytes/write ","))))
 
 ;; # Bencode
 ;;
@@ -250,7 +285,7 @@
     (if-some [key (read-bencode input)]
       (if-some [val (read-bencode input)]
         (recur (assoc! m (string<payload key) val))
-        (throw (EOFException. "Invalid bencode map. Unexpected end of input.")))
+        (throw (#?(:clj EOFException. :clje eof-error) "Invalid bencode map. Unexpected end of input.")))
       (persistent! m))))
 
 ;; Note that we use `nil` to represent the terminator read from the input. It is
@@ -259,19 +294,19 @@
 
 (defn read-bencode
   "Read bencode token from the input stream."
-  [^PushbackInputStream input]
+  [^#?(:clj PushbackInputStream :clje erlang.Type) input]
   (let [first-byte (read-byte input)]
     (cond (= first-byte i) (read-integer input)
           (= first-byte l) (read-list input)
           (= first-byte d) (read-map input)
           (= first-byte e) nil
-          :else (do (.unread input first-byte)
+          :else (do (#?(:clj .unread :clje bytes/unread) input first-byte)
                     (read-netstring* input)))))
 
 (defn read-nrepl-message
   "Same as `read-bencode`, but ensure that the top-level value is a map as
   expected by the nREPL protocol."
-  [^PushbackInputStream input]
+  [^#?(:clj PushbackInputStream :clje erlang.Type) input]
   (let [first-byte (read-byte input)]
     (if (= first-byte d)
       (read-map input)
@@ -299,15 +334,21 @@ Wrong first byte: %s (must be %d)." first-byte d) {})))))
   (write-bencode* thing output))
 
 (defn- throw-illegal-value [obj what]
-  (throw (IllegalArgumentException.
-          (format "Cannot write %s of type %s" what (class obj)))))
+  (throw (#?(:clj IllegalArgumentException. :clje clojerl.BadArgumentError.)
+          (format "Cannot write %s of type %s" what (#?(:clj class :clje type) obj)))))
 
 ;; Lists and maps work recursively to print their elements.
 
-(defn- write-bencode-list [lst, ^OutputStream output]
+(#?(:clj defn- :clje comment) write-bencode-list [lst, ^OutputStream output]
   (.write output (unchecked-int l))
   (run! #(write-bencode output %) lst)
   (.write output (unchecked-int e)))
+
+#?(:clje
+   (defn- write-bencode-list [lst output]
+     (bytes/write output "l")
+     (run! #(write-bencode output %) lst)
+     (bytes/write output "e")))
 
 ;; However, maps are special because their keys are sorted lexicographically
 ;; based on their byte string representation.
@@ -315,10 +356,11 @@ Wrong first byte: %s (must be %d)." first-byte d) {})))))
 (defn- named>string [named]
   (cond (string? named) named
         (symbol? named) (str named)
-        (keyword? named) (str (.sym ^clojure.lang.Keyword named))
+        (keyword? named) #?(:clj (str (.sym ^clojure.lang.Keyword named))
+                            :clje (str (some-> (namespace named) (str "/")) (name named)))
         :else (throw-illegal-value named "map key")))
 
-(defn- write-bencode-map [^IPersistentMap m, ^OutputStream output]
+(#?(:clj defn- :clje comment) write-bencode-map [^IPersistentMap m, ^OutputStream output]
   ;; The implementation here is quite unidiomatic for performance reasons. We
   ;; need to transform the keys of a map to strings, then sort the kvs
   ;; lexicographically by key, then write to output. To avoid creating redundant
@@ -342,7 +384,17 @@ Wrong first byte: %s (must be %d)." first-byte d) {})))))
         (write-bencode output (.nth kv 1))))
     (.write output (unchecked-int e))))
 
-(extend-protocol BencodeSerializable
+#?(:clje
+   (defn- write-bencode-map [m output]
+     ;; Erlang orders binaries byte by byte, which is the bencode key order.
+     (let [kvs (sort-by first (map (fn [[k v]] [(named>string k) v]) m))]
+       (bytes/write output "d")
+       (doseq [[k v] kvs]
+         (write-netstring* output (string>payload k))
+         (write-bencode output v))
+       (bytes/write output "e"))))
+
+(#?(:clj extend-protocol :clje comment) BencodeSerializable
   nil
   (write-bencode* [_ output]
     ;; Treat nil as an empty list.
@@ -400,3 +452,32 @@ Wrong first byte: %s (must be %d)." first-byte d) {})))))
       (write-bencode-list o output)
 
       :else (throw-illegal-value o "value"))))
+
+#?(:clje
+   (extend-protocol BencodeSerializable
+     nil
+     (write-bencode* [_ output]
+       ;; Treat nil as an empty list.
+       (write-bencode* [] output))
+
+     clojerl.String
+     (write-bencode* [s output]
+       ;; A binary is already UTF-8 bytes, or raw bytes.
+       (write-netstring* output s))
+
+     clojerl.Integer
+     (write-bencode* [n output]
+       (bytes/write output #erl("i" (str n) "e")))
+
+     clojerl.Keyword
+     (write-bencode* [named output] (write-bencode* (named>string named) output))
+
+     clojerl.Symbol
+     (write-bencode* [named output] (write-bencode* (named>string named) output))
+
+     default
+     (write-bencode* [o output]
+       (cond
+         (map? o) (write-bencode-map o output)
+         (or (coll? o) (erlang/is_list o)) (write-bencode-list o output)
+         :else (throw-illegal-value o "value")))))

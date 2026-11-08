@@ -12,32 +12,34 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as tc.prop]
             [clojure.test.check.clojure-test :refer [defspec]]
+            #?(:clje [clojure.test.check :as tc])
             [nrepl.bencode :as bencode :refer [read-bencode
                                                read-netstring
                                                write-bencode
-                                               write-netstring]])
-  (:import clojure.lang.RT
-           [java.io ByteArrayInputStream ByteArrayOutputStream PushbackInputStream]))
+                                               write-netstring]]
+            #?(:clje [nrepl.beam.bytes :as bytes]))
+  #?(:clj (:import clojure.lang.RT
+                   [java.io ByteArrayInputStream ByteArrayOutputStream PushbackInputStream])))
 
 (defn #^{:private true} >bytes
-  [#^String input]
-  (.getBytes input "UTF-8"))
+  [#^#?(:clj String :clje clojerl.String) input]
+  #?(:clj (.getBytes input "UTF-8") :clje input))
 
-(defmulti #^{:private true} <bytes class)
+(defmulti #^{:private true} <bytes #?(:clj class :clje type))
 
 (defmethod <bytes :default
   [input]
   input)
 
-(defmethod <bytes (RT/classForName "[B")
+(#?(:clj defmethod :clje comment) <bytes (RT/classForName "[B")
   [#^"[B" input]
   (String. input "UTF-8"))
 
-(defmethod <bytes clojure.lang.IPersistentVector
+(defmethod <bytes #?(:clj clojure.lang.IPersistentVector :clje clojerl.Vector)
   [input]
   (vec (map <bytes input)))
 
-(defmethod <bytes clojure.lang.IPersistentMap
+(defmethod <bytes #?(:clj clojure.lang.IPersistentMap :clje clojerl.Map)
   [input]
   (->> input
        (map (fn [[k v]] [k (<bytes v)]))
@@ -46,14 +48,14 @@
 (defn- decode
   [bytes & {:keys [reader]}]
   (-> bytes
-      ByteArrayInputStream.
-      PushbackInputStream.
+      #?(:clj ByteArrayInputStream. :clje bytes/binary-input)
+      #?@(:clj [PushbackInputStream.])
       reader))
 
 (defn- >input
-  [^String input & args]
+  [^#?(:clj String :clje clojerl.String) input & args]
   (-> input
-      (.getBytes "UTF-8")
+      #?(:clj (.getBytes "UTF-8"))
       (#(apply decode % args))
       <bytes))
 
@@ -94,16 +96,16 @@
     "d6:cheesei42e3:haml4:eggsee" {"cheese" 42 "ham" ["eggs"]}))
 
 (defn- >stream
-  ^ByteArrayOutputStream
+  ^#?(:clj ByteArrayOutputStream :clje erlang.Type)
   [thing & {:keys [writer]}]
-  (doto (ByteArrayOutputStream.)
+  (doto #?(:clj (ByteArrayOutputStream.) :clje (bytes/binary-output))
     (writer thing)))
 
 (defn- >output
   [& args]
   (-> >stream
-      ^ByteArrayOutputStream (apply args)
-      (.toString "UTF-8")))
+      ^#?(:clj ByteArrayOutputStream :clje erlang.Type) (apply args)
+      #?(:clj (.toString "UTF-8") :clje bytes/output->binary)))
 
 (deftest test-netstring-writing
   (are [x y] (= (>output (>bytes x) :writer write-netstring) y)
@@ -126,7 +128,7 @@
     "Hällö, Würld!"  "16:Hällö, Würld!"
     "Здравей, Свят!" "25:Здравей, Свят!"))
 
-(deftest test-input-stream-writing
+(#?(:clj deftest :clje comment) test-input-stream-writing
   (are [x y] (= (>output (ByteArrayInputStream. (>bytes x))
                          :writer write-bencode) y)
     ""               "0:"
@@ -140,13 +142,14 @@
     42 "i42e"
     -42 "i-42e"
 
-    ;; Works for all integral types.
-    ;; Note: BigInts (42N) not tested, since they are not
-    ;; supported in 1.2.
-    (Byte/parseByte "42" 10)   "i42e"
-    (Short/parseShort "42" 10) "i42e"
-    (Integer/parseInt "42" 10) "i42e"
-    (Long/parseLong "42" 10)   "i42e"))
+    #?@(:clj
+        [;; Works for all integral types.
+         ;; Note: BigInts (42N) not tested, since they are not
+         ;; supported in 1.2.
+         (Byte/parseByte "42" 10)   "i42e"
+         (Short/parseShort "42" 10) "i42e"
+         (Integer/parseInt "42" 10) "i42e"
+         (Long/parseLong "42" 10)   "i42e"])))
 
 (deftest test-named-writing
   (are [x y] (= (>output x :writer write-bencode) y)
@@ -180,7 +183,7 @@
     (is (= "d6:cheesei4e4:eggsi1e3:hami0e7:hamburgi3e9:hamburgeri2ee"
            (>output source :writer write-bencode)))))
 
-(deftest unencoded-values
+(#?(:clj deftest :clje comment) unencoded-values
   ;; just some PNG data that won't round-trip cleanly through UTF-8 encoding, so
   ;; any default encoding in the bencode implementation will be caught immediately
   (let [binary-data (byte-array
@@ -198,20 +201,51 @@
                (get "data")
                seq)))))
 
-(deftest unwritable-values
+#?(:clje
+   (deftest unencoded-values
+     ;; The same PNG data as the JVM test, as a binary that is not valid UTF-8.
+     (let [binary-data (erlang/list_to_binary
+                        (clj_rt/to_list
+                         (map #(bit-and % 255)
+                              [-119 80 78 71 13 10 26 10 0 0 0 13 73 72 68 82 0 0 0
+                               100 0 0 0 100 8 6 0 0 0 112 -30 -107 84 0 0 3 -16 105
+                               67 67 80 73 67 67 32 80 114 111 102 105 108 101 0 0 40
+                               -111 -115 85 -35 111 -37 84 20 63 -119 111 92 -92 22 63
+                               -96 -79 -114 14 21 -117 -81 85 83 91 -71 27 26 -83 -58 6
+                               73 -109 -91 -23 66 26 -71 -51 -40 42 -92 -55 117 110])))]
+       (is (= binary-data
+              (-> {"data" binary-data}
+                  (>stream :writer write-bencode)
+                  bytes/output->binary
+                  (decode :reader read-bencode)
+                  (get "data")))))))
+
+(#?(:clj deftest :clje comment) unwritable-values
   (testing "write-bencode writes eagerly"
     (let [out (ByteArrayOutputStream.)]
       (is (thrown? IllegalArgumentException
                    (write-bencode out {"obj" (Object.)})))
       (is (= "d3:obj" (String. (.toByteArray out)))))))
 
+#?(:clje
+   (deftest unwritable-values
+     (testing "write-bencode writes eagerly"
+       (let [out (bytes/binary-output)]
+         (is (thrown? clojerl.BadArgumentError
+                      (write-bencode out {"obj" (erlang/make_ref)})))
+         (is (= "d3:obj" (bytes/output->binary out)))))))
+
 ;; ## Generative testing.
 ;;
 ;; Verify that any valid value remains the same after encode-decode roundtrip.
 
-(def valid-bencode-input-generator
+;; clojerl accepts only literal values in a top-level def, so on clje the
+;; generator is the return value of a function.
+
+(#?(:clj def :clje defn) valid-bencode-input-generator
   "This is a recursive test.check generator that can generate a string, a number,
   or a list or a map that contains any other valid value."
+  #?@(:clje [[]])
   (gen/recursive-gen #(gen/one-of [%
                                    (gen/vector % 0 20)
                                    (gen/map gen/string % {:min-elements 0
@@ -222,10 +256,22 @@
 ;; making any changes to `nrepl.bencode`, make sure to increase this number and
 ;; extensively run this locally.
 
-(defspec generative-roundtrip-test {:num-tests 30}
+(#?(:clj defspec :clje comment) generative-roundtrip-test {:num-tests 30}
   (tc.prop/for-all
    [value valid-bencode-input-generator]
    (= value (>input (>output value :writer write-bencode) :reader read-bencode))))
+
+;; clje test.check `defspec` expands to a `defn-` with a qualified name,
+;; which the clojerl core specs reject. So clje runs the property directly.
+
+#?(:clje
+   (deftest generative-roundtrip-test
+     (let [result (tc/quick-check
+                   30
+                   (tc.prop/for-all
+                    [value (valid-bencode-input-generator)]
+                    (= value (>input (>output value :writer write-bencode) :reader read-bencode))))]
+       (is (:pass? result) (pr-str result)))))
 
 ;; ## Performance testing
 ;;

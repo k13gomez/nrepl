@@ -12,14 +12,15 @@
    :added  "0.5"}
   (:require
    [clojure.edn :as edn]
-   [clojure.java.io :as io]
-   [clojure.string :as str]))
+   #?(:clj [clojure.java.io :as io])
+   [clojure.string :as str]
+   #?@(:clje [[nrepl.beam.compat :refer [getenv home-dir]]])))
 
-(def ^:private home-dir
+(#?(:clj def :clje comment) ^:private home-dir
   "The user's home directory."
   (System/getProperty "user.home"))
 
-(def ^:private xdg-config-default-dir
+(#?(:clj def :clje comment) ^:private xdg-config-default-dir
   "Default XDG config directory (~/.config)."
   (io/file home-dir ".config"))
 
@@ -28,12 +29,12 @@
   Return the value of the environment variable if it's non-empty,
   or `nil` otherwise."
   [env-var]
-  (let [value (System/getenv env-var)]
+  (let [value #?(:clj (System/getenv env-var) :clje (getenv env-var))]
     (when-not (str/blank? value) value)))
 
 (def ^:private config-file-name "nrepl.edn")
 
-(def config-file
+(#?(:clj def :clje comment) config-file
   "nREPL's global configuration file.
 
   The location is determined with the following precedence:
@@ -55,17 +56,17 @@
               candidates)
         (last candidates))))
 
-(def config-dir
+(#?(:clj def :clje comment) config-dir
   "nREPL's global configuration directory."
   (.getParentFile ^java.io.File config-file))
 
-(defn- load-edn
+(#?(:clj defn- :clje comment) load-edn
   "Load edn from an io/reader source (filename or io/resource)."
   [source]
   (with-open [r (io/reader source)]
     (edn/read (java.io.PushbackReader. r))))
 
-(defn- load-config
+(#?(:clj defn- :clje comment) load-config
   "Load the configuration file identified by `file`.
   Return its contents as EDN if the file exists,
   or an empty map otherwise."
@@ -74,7 +75,7 @@
     (load-edn file)
     {}))
 
-(def config
+(#?(:clj def :clje comment) config
   "Configuration map.
   It's created by merging the global configuration file
   with a local configuration file that would normally
@@ -83,3 +84,27 @@
   (merge
    (load-config config-file)
    (load-config (io/file ".nrepl.edn"))))
+
+#?(:clje
+   (def ^:private config-cache (atom nil)))
+
+#?(:clje
+   (defn config*
+     "Return the configuration map, as `config` does on the JVM.
+  The BEAM build computes top-level `def` values at compile time.
+  So this function reads the config files at the first call and caches the result."
+     []
+     (or @config-cache
+         (let [file* (fn [& parts] (filename/join (clj_rt/to_list parts)))
+               exists? (fn [f] (and f (filelib/is_regular f)))
+               load* (fn [f] (if (exists? f) (edn/read-string (slurp f)) {}))
+               home (home-dir)
+               candidates [(some-> (non-empty-env "NREPL_CONFIG_DIR") (file* config-file-name))
+                           (some-> (non-empty-env "XDG_CONFIG_HOME") (file* "nrepl" config-file-name))
+                           (file* home ".config" "nrepl" config-file-name)
+                           (file* home ".nrepl" config-file-name)]
+               config-file (or (some #(when (exists? %) %) candidates)
+                               (last candidates))]
+           (reset! config-cache
+                   (merge (load* config-file)
+                          (load* ".nrepl.edn")))))))

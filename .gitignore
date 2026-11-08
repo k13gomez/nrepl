@@ -27,3 +27,10 @@ build.xml
 /.clj-kondo/.cache
 /.lsp/
 /.claude/
+
+# BEAM build (rebar3 + rebar3_clojerl)
+/_build/
+/_checkouts/
+rebar3.crashdump
+erl_crash.dump
+*.beam

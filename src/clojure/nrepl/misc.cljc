@@ -2,9 +2,10 @@
   "Misc utilities used in nREPL's implementation (potentially also
   useful for anyone extending it)."
   {:author "Chas Emerick"}
-  (:require [clojure.java.io :as io]
+  (:require #?(:clj [clojure.java.io :as io])
             [clojure.string :as str]
-            [nrepl.config :refer [config]]))
+            [nrepl.config :refer [#?(:clj config :clje config*)]]
+            #?@(:clje [[nrepl.beam.compat :refer [throwable?]]])))
 
 (defn log
   "Log a message to *err*. The first argument can optionally be a keyword
@@ -14,19 +15,20 @@
   (let [[kw ex-or-msg msgs] (if (keyword? ?kw)
                               [?kw ex-or-msg msgs]
                               [:error ?kw (cons ex-or-msg msgs)])
-        ex (when (instance? Throwable ex-or-msg) ex-or-msg)
+        ex (when #?(:clj (instance? Throwable ex-or-msg) :clje (throwable? ex-or-msg)) ex-or-msg)
         msgs (if ex msgs (filter identity (cons ex-or-msg msgs)))]
     (binding [*out* *err*]
       (apply println (str (str/upper-case (name kw)) ":") msgs)
-      (when ex (.printStackTrace ^Throwable ex (java.io.PrintWriter. *out*))))))
+      (when ex #?(:clj (.printStackTrace ^Throwable ex (java.io.PrintWriter. *out*))
+                  :clje (println (str ex)))))))
 
 (defmacro log-exceptions
   "Execute body, logging and re-throwing any exception."
   [& body]
   `(try
      ~@body
-     (catch Throwable ex#
-       (log ex#)
+     (catch #?(:clj Throwable :clje ~'_) ex#
+       (log #?@(:clje [:error]) ex#)
        (throw ex#))))
 
 (defmacro returning
@@ -39,12 +41,12 @@
 (defmacro ignore-exceptions
   "Execute `body`. If any Exception is thrown, then return `nil`."
   [& body]
-  `(try ~@body (catch Exception _#)))
+  `(try ~@body (catch #?(:clj Exception :clje ~'_) _#)))
 
 (defn uuid
   "Returns a new UUID string."
   []
-  (str (java.util.UUID/randomUUID)))
+  (str #?(:clj (java.util.UUID/randomUUID) :clje (erlang.util.UUID/random))))
 
 (defn take-until
   "Like (take-while (complement f) coll), but includes the first item in coll that
@@ -78,7 +80,7 @@
                                              #{status})))
         basis (merge (when id {:id id})
                      ;; AReference should make this suitable for any session implementation?
-                     (when session {:session (if (instance? clojure.lang.AReference session)
+                     (when session {:session (if (instance? #?(:clj clojure.lang.AReference :clje clojerl.Atom) session)
                                                (-> session meta :id)
                                                session)}))]
     (merge basis response)))
@@ -94,7 +96,7 @@
   [msg dynvar]
   `(get (some-> (:session ~msg) deref) (var ~dynvar) ~dynvar))
 
-(defmacro with-session-classloader
+(#?(:clj defmacro :clje comment) with-session-classloader
   "Bind `clojure.lang.Compiler/LOADER` to the context classloader. This is
   required to get hotloading with pomegranate working under certain conditions."
   [& body]
@@ -102,7 +104,13 @@
      (with-bindings {clojure.lang.Compiler/LOADER cl#}
        ~@body)))
 
-(defn parse-java-version
+#?(:clje
+   (defmacro with-session-classloader
+     "Execute `body`. The BEAM has no classloaders, so this macro adds nothing."
+     [& body]
+     `(do ~@body)))
+
+(#?(:clj defn :clje comment) parse-java-version
   "Parse Java version string according to JEP 223 and return version as a number."
   []
   (try (let [s (System/getProperty "java.specification.version")
@@ -112,6 +120,12 @@
            major
            (Integer/parseInt minor)))
        (catch Exception _ 8)))
+
+#?(:clje
+   (defn parse-java-version
+     "Return nil. The BEAM has no Java version."
+     []
+     nil))
 
 (def java-version "Current Java version number." (parse-java-version))
 
@@ -127,7 +141,8 @@
   []
   ;; -Djdk.attach.allowAttachSelf sets the property to "" if it is present,
   ;; otherwise that property will be nil.
-  (boolean (System/getProperty "jdk.attach.allowAttachSelf")))
+  #?(:clj (boolean (System/getProperty "jdk.attach.allowAttachSelf"))
+     :clje false))
 
 (defn jvmti-agent-enabled?
   "Return true if nREPL is allowed to load its JVMTI agent at runtime."
@@ -136,7 +151,7 @@
        ;; JVMTI agent is a "soft opt-in" — if attachSelf is enabled, then we
        ;; consider this a permission to load the agent, UNLESS the user
        ;; explicitly opts out of it in the config.
-       (boolean (:enable-jvmti-agent config true))))
+       (boolean (:enable-jvmti-agent #?(:clj config :clje (config*)) true))))
 
 (def safe-var-metadata
   "A list of var metadata attributes are safe to return to the clients.
@@ -154,7 +169,7 @@
     (str (if (string? value)
            ;; try to convert relative file paths like "clojure/core.clj"
            ;; to absolute file paths
-           (or (io/resource value) value)
+           (or #?(:clj (io/resource value) :clje nil) value)
            ;; If :file is a File or URL object we just return it as is
            ;; and convert it to string
            value))))
