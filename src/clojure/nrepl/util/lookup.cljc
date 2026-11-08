@@ -11,7 +11,7 @@
   (:require
    #?(:clj [clojure.java.io :as io])
    [nrepl.misc :as misc]
-   #?(:clje [nrepl.beam.compat :refer [requiring-resolve]])))
+   #?(:clje [nrepl.beam.compat :as compat :refer [requiring-resolve]])))
 
 (defn special-sym-meta
   [sym]
@@ -23,9 +23,19 @@
            :file #?(:clj "clojure/core.clj" :clje "clojure/core.clje")
            :special-form "true")))
 
+#?(:clje
+   (defn- var-meta
+     "Return the metadata of the var `v`, with its :ns and :name. The vars
+  that clojerl defines in Erlang, such as `*assert*`, have no metadata."
+     [v]
+     (let [s (str v)
+           var-sym (symbol (erlang/binary_part s 2 (- (erlang/byte_size s) 2)))]
+       (merge {:ns (symbol (namespace var-sym)) :name (symbol (name var-sym))}
+              (meta v)))))
+
 (defn normal-sym-meta
   [ns sym]
-  (some-> (ns-resolve ns sym) meta))
+  (some-> (ns-resolve ns sym) #?(:clj meta :clje var-meta)))
 
 (#?(:clj defn- :clje comment) ns-file
   "The classpath-relative path of the file `the-ns` loads from, if any."
@@ -63,4 +73,7 @@
   If the `sym` is not qualified then it will be resolved in the context
   of `ns`, where it can also be a namespace's alias."
   [ns sym]
+  ;; A namespace that clojerl loads from a beam has no refers or aliases
+  ;; until they are restored.
+  #?(:clje (some-> (find-ns ns) compat/restore-ns-mappings!))
   (some-> (sym-meta ns sym) misc/sanitize-meta))

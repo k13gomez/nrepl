@@ -8,7 +8,8 @@
   {:clj-kondo/config '{:linters {:unused-binding {:level :off}}}
    :author "Oleksandr Yakushev, Bozhidar Batsov"
    :added  "0.8"}
-  (:require [clojure.string :as str])
+  (:require [clojure.string :as str]
+            #?(:clje [nrepl.beam.compat :as compat]))
   #?(:clj
      (:import java.io.File
               java.nio.file.Files
@@ -748,13 +749,26 @@
 
 ;; compliment/core.clj
 
-(defn ensure-ns
+(#?(:clj defn :clje comment) ensure-ns
   "Takes either a namespace object or a symbol and returns the corresponding\n  namespace if it exists, otherwise returns `user` namespace."
   [nspc]
-  (or (and (instance? #?(:clj clojure.lang.Namespace :clje clojerl.Namespace) nspc) nspc)
+  (or (and (instance? clojure.lang.Namespace nspc) nspc)
       (and (symbol? nspc) (find-ns nspc))
       (find-ns 'user)
       *ns*))
+
+#?(:clje
+   (defn ensure-ns
+     "Takes either a namespace object or a symbol and returns the corresponding
+  namespace if it exists, otherwise returns `user` namespace. A namespace
+  that clojerl loads from a beam has no refers or aliases, so this restores
+  them first."
+     [nspc]
+     (doto (or (and (instance? clojerl.Namespace nspc) nspc)
+               (and (symbol? nspc) (find-ns nspc))
+               (find-ns 'user)
+               *ns*)
+       (compat/restore-ns-mappings!))))
 
 (defn completions
   "Returns a list of completions for the given prefix and namespace."

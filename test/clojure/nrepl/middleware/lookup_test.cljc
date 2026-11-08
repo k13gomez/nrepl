@@ -5,8 +5,9 @@
    [nrepl.core :as nrepl]
    [nrepl.core-test :refer [def-repl-test repl-server-fixture project-base-dir clean-response]]
    [nrepl.test-helpers :refer [is+]])
-  (:import
-   (java.io File)))
+  #?(:clj
+     (:import
+      (java.io File))))
 
 (use-fixtures :each repl-server-fixture)
 

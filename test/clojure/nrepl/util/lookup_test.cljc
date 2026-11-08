@@ -3,8 +3,9 @@
             [matcher-combinators.matchers :as matchers]
             [nrepl.bencode :as bencode]
             [nrepl.test-helpers :refer [is+]]
-            [nrepl.util.lookup :as l :refer [lookup]])
-  (:import (java.io ByteArrayOutputStream)))
+            [nrepl.util.lookup :as l :refer [lookup]]
+            #?(:clje [nrepl.beam.bytes :as bytes]))
+  #?(:clj (:import (java.io ByteArrayOutputStream))))
 
 (deftest lookup-test
   (testing "special sym lookup"
@@ -50,7 +51,7 @@
     (is+ {:ns "clojure.string"
           :name "clojure.string"
           :doc #"Clojure String utilities"
-          :file #"clojure/string\.clj$"}
+          :file #?(:clj #"clojure/string\.clj$" :clje #"clojure/string\.clje$")}
          (lookup 'nrepl.util.lookup-test 'clojure.string))
 
     (testing "by its alias"
@@ -60,7 +61,8 @@
 
     (testing "from a .cljc file"
       (is+ {:name "matcher-combinators.matchers"
-            :file #"matcher_combinators/matchers\.cljc$"}
+            ;; On the BEAM this namespace is the shim in test/clje.
+            :file #?(:clj #"matcher_combinators/matchers\.cljc$" :clje #"matcher_combinators/matchers\.clje$")}
            (lookup 'nrepl.util.lookup-test 'matcher-combinators.matchers)))
 
     (testing "without a file"
@@ -80,14 +82,14 @@
 (defn- bencode-str
   "Bencode a thing and write it into a string."
   [thing]
-  (let [out (ByteArrayOutputStream.)]
+  (let [out #?(:clj (ByteArrayOutputStream.) :clje (bytes/binary-output))]
     (try
       (bencode/write-bencode out thing)
-      (.toString out)
-      (catch IllegalArgumentException ex
-        (throw (ex-info (.getMessage ex) {:thing thing}))))))
+      #?(:clj (.toString out) :clje (bytes/output->binary out))
+      (catch #?(:clj IllegalArgumentException :clje clojerl.BadArgumentError) ex
+        (throw (ex-info #?(:clj (.getMessage ex) :clje (ex-message ex)) {:thing thing}))))))
 
-(defn- lookup-public-vars
+(#?(:clj defn- :clje comment) lookup-public-vars
   "Look up every public var in all namespaces in the classpath and return the result as a set."
   []
   (transduce
@@ -98,6 +100,15 @@
    conj
    #{}
    (all-ns)))
+
+;; Some clojerl vars have no metadata, and clojerl keys ns-publics by string.
+#?(:clje
+   (defn- lookup-public-vars
+     "Look up every public var in all namespaces and return the result as a set."
+     []
+     (set (for [ns (apply list (all-ns))
+                [sym _] (apply list (ns-publics ns))]
+            (lookup (ns-name ns) (symbol sym))))))
 
 (deftest bencode-test
   (doseq [m (lookup-public-vars)]

@@ -26,7 +26,7 @@
   ([prefix ns]
    (apply distinct? (candidates prefix ns))))
 
-(deftest completions-test
+(#?(:clj deftest :clje comment) completions-test
   (testing "var completion"
     (is+ ["alength" "alias" "all-ns" "alter" "alter-meta!" "alter-var-root" "aset-long"]
          (candidates "al" 'clojure.core))
@@ -103,7 +103,7 @@
     (is+ (mc/embeds [{:candidate ".toString" :type :method}])
          (completions ".toString" 'clojure.core))))
 
-(deftest keyword-completions-test
+(#?(:clj deftest :clje comment) keyword-completions-test
   (testing "colon prefix"
     (is+ (mc/embeds [":doc" ":refer" ":refer-clojure"])
          (candidates ":" *ns*)))
@@ -132,3 +132,57 @@
 
   (testing "namespace aliases without namespace"
     (is+ [] (candidates "::/" *ns*))))
+
+;; The BEAM has no Java classes and no keyword table, so those sources do not
+;; exist there. Instead it completes Erlang modules and their functions.
+
+#?(:clje
+   (deftest completions-test
+     (testing "var completion"
+       ;; clojerl has no refs, so there is no `alter`.
+       (is+ (mc/embeds ["alias" "all-ns" "alter-meta!" "alter-var-root"])
+            (candidates "al" 'clojure.core))
+       (is+ ["clojure.core/alter-meta!" "clojure.core/alter-var-root"]
+            (candidates "clojure.core/alt" 'clojure.core))
+       (is+ [] (candidates "fake-ns-here/"))
+       (is+ [] (candidates "/")))
+
+     (testing "namespace completion"
+       (is+ (mc/embeds ["nrepl.util.completion" "nrepl.util.completion-test"])
+            (candidates "nrepl.util.comp"))
+       (is+ (mc/embeds ["clojure.core" "clojure.core.server"])
+            (candidates "clojure.co"))
+       (testing "of a namespace that is not loaded yet"
+         (is+ (mc/embeds ["clojure.zip"])
+              (candidates "clojure.zi"))))
+
+     (testing "Erlang module completion"
+       (is+ (mc/embeds ["lists"]) (candidates "lis"))
+       (is (distinct-candidates? "lis")))
+
+     (testing "Erlang function completion"
+       (is+ (mc/embeds ["lists/map" "lists/mapfoldl"]) (candidates "lists/ma"))
+       (is (distinct-candidates? "lists/ma"))
+       (is+ [] (candidates "no_such_module/fu")))
+
+     (testing "candidate types"
+       (is+ (mc/embeds [{:candidate "t-var"
+                         :ns "nrepl.util.completion-test"
+                         :type :var}])
+            (completions "t-var" 'nrepl.util.completion-test))
+       (is+ (mc/embeds [{:candidate "t-fn"
+                         :ns "nrepl.util.completion-test"
+                         :type :function}])
+            (completions "t-fn" 'nrepl.util.completion-test))
+       (is+ (mc/embeds [{:candidate "t-macro"
+                         :ns "nrepl.util.completion-test"
+                         :type :macro}])
+            (completions "t-macro" 'nrepl.util.completion-test))
+       (is+ (mc/embeds [{:candidate "if" :type :special-form}])
+            (completions "if" 'clojure.core))
+       (is+ (mc/embeds [{:candidate "nrepl.util.completion-test" :type :namespace}])
+            (completions "nrepl.util.completion-test" 'clojure.core))
+       (is+ (mc/embeds [{:candidate "lists" :type :namespace}])
+            (completions "lists" 'clojure.core))
+       (is+ (mc/embeds [{:candidate "lists/map" :type :function}])
+            (completions "lists/map" 'clojure.core)))))
