@@ -88,5 +88,8 @@
                                 (= (count expected) (count actual))
                                 (every? true? (map match-value expected actual)))
     (instance? erlang.util.Regex expected) (and (string? actual) (some? (re-find expected actual)))
+    ;; clojerl passes a function such as `not-empty` as a var. A var
+    ;; matches an equal var, and otherwise acts as a predicate.
+    (and (var? expected) (var? actual)) (= expected actual)
     (fn? expected) (boolean (expected actual))
     :else (= expected actual)))

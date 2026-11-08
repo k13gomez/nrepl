@@ -1,16 +1,20 @@
 (ns nrepl.cmdline-tty-test
   "TTY is not a full-featured transport (e.g. doesn't support ack), so are tested
    separately here."
-  (:require [clojure.java.io :as io]
+  (:require #?(:clj [clojure.java.io :as io])
             [clojure.test :refer [deftest is testing]]
             [nrepl.cmdline :as cmd]
             [nrepl.server :as server]
-            [nrepl.test-helpers :refer [free-port is+ sh]]
-            [nrepl.transport :as transport])
-  (:import (java.io BufferedReader PrintStream)
-           (org.apache.commons.net.telnet TelnetClient)))
+            [nrepl.test-helpers :refer [free-port is+ #?(:clj sh)]]
+            [nrepl.transport :as transport]
+            #?@(:clje [[clojure.string :as str]
+                       [nrepl.beam.bytes :as bytes]
+                       [nrepl.beam.socket :as beam-socket]]))
+  #?(:clj
+     (:import (java.io BufferedReader PrintStream)
+              (org.apache.commons.net.telnet TelnetClient))))
 
-(defn- attempt-connection [client host port timeout-ms]
+(#?(:clj defn- :clje comment) attempt-connection [client host port timeout-ms]
   (loop [n (/ timeout-ms 500)]
     (or (try
           (.connect ^TelnetClient client ^String host ^int port)
@@ -22,7 +26,7 @@
           (Thread/sleep 500)
           (recur (dec n))))))
 
-(deftest ^:slow tty-server
+(#?(:clj deftest :clje comment) ^:slow tty-server
   (let [port (free-port)
         server-process (sh ["java" "-Dnreplacktest=y"
                             "-cp" (System/getProperty "java.class.path")
@@ -64,5 +68,40 @@
       (let [options (cmd/connection-opts {:port      (:port server)
                                           :host      "localhost"
                                           :transport 'nrepl.transport/tty})]
-        (is (thrown? clojure.lang.ExceptionInfo
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :clje clojerl.ExceptionInfo)
                      (cmd/interactive-repl server options)))))))
+
+;; The BEAM version runs the tty server in this VM and talks to it over a
+;; plain TCP connection.
+
+#?(:clje
+   (defn- read-line-bytes
+     "Read one line from the connection `conn`, without the newline."
+     [conn]
+     (loop [acc []]
+       (let [b (bytes/read-byte conn)]
+         (if (or (= -1 b) (= 10 b))
+           (erlang/list_to_binary (clj_rt/to_list acc))
+           (recur (conj acc b)))))))
+
+#?(:clje
+   (deftest tty-server
+     (with-open [server (server/start-server :transport-fn #'transport/tty
+                                             :greeting-fn (#'cmd/options->greeting {} #'transport/tty))
+                 conn (beam-socket/tcp-client "127.0.0.1" (:port server) 10000)]
+       (bytes/write conn (str (str/join "\n" ["(+ 1 2)"
+                                              "#?(:clje :clje-form)"
+                                              "(clojure.core/require '[clojure.string :as s])"
+                                              "::s/xyz"
+                                              "(clojure.core/require '[clojure.set :as sets])"
+                                              "[::s/x ::sets/x]"])
+                              "\n"))
+       (is+ [#"^;; nREPL"
+             #"^;; Clojure"
+             "user=> 3"
+             "user=> :clje-form"
+             "user=> nil"
+             "user=> :clojure.string/xyz"
+             "user=> nil"
+             "user=> [:clojure.string/x :clojure.set/x]"]
+            (vec (repeatedly 8 #(read-line-bytes conn)))))))

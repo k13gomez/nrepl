@@ -3,7 +3,8 @@
             [nrepl.test-helpers :refer [win?]]
             [clojure.test :refer :all]))
 
-(when (and (>= misc/java-version 21) (not win?))
+;; The BEAM has no JVMTI, so this test runs only on the JVM.
+(#?(:clj when :clje comment) (and (>= misc/java-version 21) (not win?))
   (deftest stop-thread-test
     (let [vol (volatile! 0)
           t (doto (Thread. #(while (vswap! vol inc))) .start)]

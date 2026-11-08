@@ -80,13 +80,15 @@
 #?(:clje
    (defmacro with-timeout
      "Runs BODY in another process and gives up after MS milliseconds, throwing
-  instead of hanging the whole test run."
+  instead of hanging the whole test run. The process gets the bindings of
+  the caller, as a JVM future does."
      [ms & body]
      `(let [parent# (erlang/self)
             ref# (erlang/make_ref)
+            bindings# (get-thread-bindings)
             pid# (erlang/spawn (fn []
                                  (erlang/send parent#
-                                              (try #erl[ref# :ok (do ~@body)]
+                                              (try #erl[ref# :ok (with-bindings* bindings# (fn [] ~@body))]
                                                    (catch ~'_ e# #erl[ref# :error e#])))))]
         (receive*
          #erl[ref# :ok v#] v#

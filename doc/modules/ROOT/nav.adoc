@@ -6,6 +6,7 @@
 ** xref:usage/clients.adoc[Clients]
 ** xref:usage/tls.adoc[TLS]
 ** xref:usage/misc.adoc[Misc]
+** xref:usage/beam.adoc[BEAM (clojerl)]
 * Design
 ** xref:design/overview.adoc[Overview]
 ** xref:design/handlers.adoc[Handlers]

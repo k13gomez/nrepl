@@ -8,37 +8,34 @@
   "Interacting with the Java crypto APIs is one of the worst things you can do
   as a developer. I'm so sorry about all of this."
   {:added "1.1"}
-  (:require #?(:clj [clojure.java.io :as io :refer [input-stream]])
-            [clojure.string :as str]
-            #?(:clje [nrepl.beam.socket :as beam-socket]))
-  #?(:clj
-     (:import (java.net InetSocketAddress)
-              (java.security KeyFactory
-                             KeyStore
-                             NoSuchAlgorithmException)
-              (java.security.cert Certificate
-                                  CertificateFactory)
-              (java.security.spec PKCS8EncodedKeySpec)
-              (javax.net.ssl HandshakeCompletedListener
-                             KeyManager
-                             KeyManagerFactory
-                             SSLContext
-                             SSLException SSLHandshakeException
-                             SSLSocket
-                             TrustManager
-                             TrustManagerFactory
-                             X509KeyManager
-                             X509TrustManager))))
+  (:require [clojure.java.io :as io :refer [input-stream]]
+            [clojure.string :as str])
+  (:import (java.net InetSocketAddress)
+           (java.security KeyFactory
+                          KeyStore
+                          NoSuchAlgorithmException)
+           (java.security.cert Certificate
+                               CertificateFactory)
+           (java.security.spec PKCS8EncodedKeySpec)
+           (javax.net.ssl HandshakeCompletedListener
+                          KeyManager
+                          KeyManagerFactory
+                          SSLContext
+                          SSLException SSLHandshakeException
+                          SSLSocket
+                          TrustManager
+                          TrustManagerFactory
+                          X509KeyManager
+                          X509TrustManager)))
 
-(defn- base64->binary ^#?(:clj bytes :clje erlang.Type) [^#?(:clj String :clje clojerl.String) string]
-  #?(:clj (.decode (java.util.Base64/getMimeDecoder) string)
-     :clje (base64/mime_decode string)))
+(defn- base64->binary ^bytes [^String string]
+  (.decode (java.util.Base64/getMimeDecoder) string))
 
-(#?(:clj def :clje comment) ^:private ^CertificateFactory x509-cert-factory
+(def ^:private ^CertificateFactory x509-cert-factory
   "The X.509 certificate factory"
   (CertificateFactory/getInstance "X.509"))
 
-(#?(:clj def :clje comment) ^:private key-store-password
+(def ^:private key-store-password
   "You know, a mandatory password stored in memory so we can... encrypt... data
   stored in memory."
   (char-array "GheesBetDyPhuvwotNolofamLydMues9"))
@@ -53,7 +50,7 @@
        "certificate and an unencrypted PKCS#8 private key (a "
        "`-----BEGIN PRIVATE KEY-----` block) in PEM format."))
 
-(#?(:clj defn- :clje comment) get-private-key [^PKCS8EncodedKeySpec spec]
+(defn- get-private-key [^PKCS8EncodedKeySpec spec]
   (loop [[algorithm & algorithms] key-factory-algorithms
          failures [] ; [algorithm exception] pairs for algorithms that failed to parse
          unavailable []]
@@ -83,17 +80,6 @@
                                (str " Not available on this JVM: " (str/join ", " unavailable) ".")))
                         {:tried tried :unavailable unavailable}
                         cause))))))
-
-#?(:clje
-   (defn- private-key-info
-     "Return the ssl key option for the PKCS#8 DER binary `der`. Throw if
-  `der` does not decode as a private key."
-     [der]
-     (try
-       (public_key/der_decode :PrivateKeyInfo der)
-       (catch _ e
-         (throw (ex-info "Could not parse the private key." {} e))))
-     #erl[:PrivateKeyInfo der]))
 
 (defn- get-parts [s begin? end?]
   (when (string? s)
@@ -132,8 +118,7 @@
                           first)]
     (cond
       pkcs8-payload
-      (-> pkcs8-payload base64->binary #?@(:clj [PKCS8EncodedKeySpec. get-private-key]
-                                           :clje [private-key-info]))
+      (-> pkcs8-payload base64->binary PKCS8EncodedKeySpec. get-private-key)
 
       (by-label "ENCRYPTED PRIVATE KEY")
       (throw (ex-info (str "The private key is password-protected, which is not supported. "
@@ -163,22 +148,13 @@
              (fn [s] (= (str/trim s) "-----BEGIN CERTIFICATE-----"))
              (fn [s] (= (str/trim s) "-----END CERTIFICATE-----"))))
 
-(#?(:clj defn- :clje comment) parse-certificate
+(defn- parse-certificate
   "Parses a single X.509 certificate from a PEM string."
   ^Certificate [^String pem]
   (with-open [stream (input-stream (.getBytes pem))]
     (.generateCertificate x509-cert-factory stream)))
 
-#?(:clje
-   (defn- parse-certificate
-     "Parses a single X.509 certificate from a PEM string. Returns its DER binary."
-     [pem]
-     (let [[entry] (public_key/pem_decode pem)]
-       (when-not entry
-         (throw (ex-info "Could not parse a certificate." {})))
-       (erlang/element 2 entry))))
-
-(#?(:clj defn- :clje comment) issued-by?
+(defn- issued-by?
   "Returns true if `cert`'s signature verifies against `issuer`'s public key.
   Returns false when verification fails for any reason, including the
   signature algorithm being unavailable on this JVM - in which case the JVM
@@ -189,15 +165,6 @@
     true
     (catch Exception _
       false)))
-
-#?(:clje
-   (defn- issued-by?
-     "Returns true if the DER certificate `cert` validates against `issuer`."
-     [cert issuer]
-     (try
-       (= :ok (erlang/element 1 (public_key/pkix_path_validation issuer #erl(cert) #erl())))
-       (catch _ _
-         false))))
 
 (defn- ca-and-chain
   "Splits the PEM certificate blocks into the trust root (CA) and the own
@@ -219,7 +186,7 @@
           {:ca b :chain [a]}
           {:ca a :chain [b]})))))
 
-(#?(:clj defn- :clje comment) key-store
+(defn- key-store
   "Makes a keystore from a private key and a public certificate"
   [key certs]
   (doto (KeyStore/getInstance (KeyStore/getDefaultType))
@@ -227,14 +194,14 @@
     ; alias, private key, password, certificate chain
     (.setKeyEntry "cert" key key-store-password certs)))
 
-(#?(:clj defn- :clje comment) trust-store
+(defn- trust-store
   "Makes a trust store, suitable for backing a TrustManager, out of a CA cert."
   [ca-cert]
   (doto (KeyStore/getInstance "JKS")
     (.load nil nil)
     (.setCertificateEntry "cacert" ca-cert)))
 
-(#?(:clj defn- :clje comment) trust-manager
+(defn- trust-manager
   "An X.509 trust manager for a KeyStore."
   [^KeyStore key-store]
   (let [factory (TrustManagerFactory/getInstance "PKIX" "SunJSSE")]
@@ -246,7 +213,7 @@
            (filter (partial instance? X509TrustManager))
            first))))
 
-(#?(:clj defn- :clje comment) key-manager
+(defn- key-manager
   "An X.509 key manager for a KeyStore."
   ([key-store password]
    (let [factory (KeyManagerFactory/getInstance "SunX509" "SunJSSE")]
@@ -258,7 +225,7 @@
   ([key-store]
    (key-manager key-store key-store-password)))
 
-(#?(:clj defn- :clje comment) ssl-context-generator
+(defn- ssl-context-generator
   "Returns a function that yields SSL contexts. Takes a PKCS8 key file, a
   certificate file, and optionally, a trusted CA certificate used to verify peers."
   ([key certs ca-cert]
@@ -277,7 +244,7 @@
                 nil
                 nil))))))
 
-(#?(:clj defn- :clje comment) close-silently [^SSLSocket sock]
+(defn- close-silently [^SSLSocket sock]
   (when sock
     (try
       (.close sock)
@@ -285,48 +252,38 @@
       (catch Throwable _
         nil))))
 
-#?(:clje
-   (defn- ssl-options
-     "Return the ssl options that take the place of an SSLContext on the BEAM."
-     [key chain ca]
-     #erl(#erl[:versions #erl(:tlsv1.3)]
-          #erl[:certs_keys #erl(#erl{:cert (first chain) :key key})]
-          #erl[:cacerts #erl(ca)]
-          #erl[:verify :verify_peer])))
-
 (defn- ssl-str-context
   "Given a string containing a PKCS8 private key, a certificate and a trusted
   CA certificate used to verify peers, returns an SSLContext."
   [tls-keys-str]
   (let [key (str->private-key tls-keys-str)
         {:keys [ca chain]} (ca-and-chain (get-certs tls-keys-str))]
-    #?(:clj ((ssl-context-generator key (into-array Certificate chain) ca))
-       :clje (ssl-options key chain ca))))
+    ((ssl-context-generator key (into-array Certificate chain) ca))))
 
 (defn ssl-context-or-throw
   "Create a SSL/TLS context from either a string or a file containing two certificates and a private key.
   Throws an exception if the SSL/TLS context could not be created."
   [tls-keys-str tls-keys-file]
   (cond
-    (and (some? tls-keys-file) (not #?(:clj (.exists (io/file tls-keys-file)) :clje (filelib/is_regular tls-keys-file))))
+    (and (some? tls-keys-file) (not (.exists (io/file tls-keys-file))))
     (throw (ex-info (str ":tls-keys-file specified as " tls-keys-file ", but the file was not found.")
                     {:nrepl/kind :nrepl.server/invalid-start-request}))
 
-    (and (some? tls-keys-file) #?(:clj (.exists (io/file tls-keys-file)) :clje (filelib/is_regular tls-keys-file)))
+    (and (some? tls-keys-file) (.exists (io/file tls-keys-file)))
     (try
       (ssl-str-context (slurp tls-keys-file))
-      (catch #?(:clj Exception :clje _) e
+      (catch Exception e
         (throw (ex-info (str "Could not create TLS context from file " tls-keys-file
-                             ". Error message: " #?(:clj (.getMessage e) :clje (or (ex-message e) (pr-str e))))
+                             ". Error message: " (.getMessage e))
                         {:nrepl/kind :nrepl.server/invalid-start-request}
                         e))))
 
     (string? tls-keys-str)
     (try
       (ssl-str-context tls-keys-str)
-      (catch #?(:clj Exception :clje _) e
+      (catch Exception e
         (throw (ex-info (str "Could not create TLS context from string. "
-                             "Error message: " #?(:clj (.getMessage e) :clje (or (ex-message e) (pr-str e))))
+                             "Error message: " (.getMessage e))
                         {:nrepl/kind :nrepl.server/invalid-start-request}
                         e))))
 
@@ -334,11 +291,11 @@
     (throw (ex-info "Could not create TLS context. Neither :tls-keys-str nor :tls-keys-file given."
                     {:nrepl/kind :nrepl.server/invalid-start-request}))))
 
-(#?(:clj def :clje comment) enabled-protocols
+(def enabled-protocols
   "An array of protocols we support."
   (into-array String ["TLSv1.3"]))
 
-(#?(:clj defn :clje comment) server-socket
+(defn server-socket
   "Given an SSL context, makes a server SSLSocket."
   ^javax.net.ssl.SSLServerSocket
   [^SSLContext context ^String host port]
@@ -351,16 +308,7 @@
       (.setReuseAddress true)
       (.setEnabledProtocols enabled-protocols))))
 
-#?(:clje
-   (defn server-socket
-     "Given ssl options from `ssl-context-or-throw`, makes a TLS server socket.
-  The server asks each client for its certificate."
-     [context host port]
-     (beam-socket/tls-server-socket
-      (lists/append context #erl(#erl[:fail_if_no_peer_cert true]))
-      host port)))
-
-(#?(:clj defn :clje comment) socket
+(defn socket
   "Given an SSL context, makes a client SSLSocket."
   ^SSLSocket
   [^SSLContext context ^String host port connect-timeout-ms]
@@ -371,20 +319,11 @@
     (.connect sock (InetSocketAddress. host ^int port) ^int connect-timeout-ms)
     sock))
 
-#?(:clje
-   (defn socket
-     "Given ssl options from `ssl-context-or-throw`, makes a TLS client
-  connection. Like the JVM version, it does not check the host name."
-     [context host port connect-timeout-ms]
-     (beam-socket/tls-client
-      (lists/append context #erl(#erl[:server_name_indication :disable]))
-      host port connect-timeout-ms)))
-
 (def ^:dynamic *handshake-timeout-ms*
   "Number of milliseconds to wait for the TLS handshake to complete."
   30000)
 
-(#?(:clj defn :clje comment) accept
+(defn accept
   "Accepts a new TLS connection. Waits `*handshake-timeout-ms*` (default: 30 000) milliseconds for the TLS handshake
   to complete. Requires that the client certificate is different from the server certificate."
   [^javax.net.ssl.SSLServerSocket server]
@@ -428,19 +367,3 @@
         (if (instance? SSLException t)
           (throw t)
           (throw (SSLException. ^Throwable t))))))) ; wrap other exceptions in SSLException to make the server accept loop continue
-
-#?(:clje
-   (defn accept
-     "Accepts a new TLS connection. Waits `*handshake-timeout-ms*` milliseconds
-  for the TLS handshake to complete. Requires that the client certificate is
-  different from the server certificate."
-     [server]
-     (let [conn (beam-socket/tls-accept server *handshake-timeout-ms*)
-           own-cert (some (fn [opt]
-                            (when (= :certs_keys (erlang/element 1 opt))
-                              (:cert (first (erlang/element 2 opt)))))
-                          (beam-socket/ssl-options server))]
-       (if (= own-cert (beam-socket/peer-cert conn))
-         (do (.close conn)
-             (throw (ex-info "Cannot use same keys as server" {::handshake-error true})))
-         conn))))

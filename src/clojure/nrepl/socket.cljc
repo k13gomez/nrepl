@@ -7,9 +7,9 @@
   (:require
    #?(:clj [clojure.java.io :as io])
    [nrepl.misc :refer [log]]
-   [nrepl.tls :as tls]
+   #?(:clj [nrepl.tls :as tls])
    #?@(:clje [[nrepl.beam.bytes :as bytes]
-              [nrepl.beam.compat :refer [requiring-resolve]]
+              [nrepl.beam.compat :refer [requiring-resolve tls-unsupported]]
               [nrepl.beam.socket :as beam-socket]]))
   #?(:clj
      (:import
@@ -42,7 +42,8 @@
          ;; a dependency on the order of ipv4 and ipv6 records for
          ;; localhost in /etc/hosts
          bind (or bind "127.0.0.1")]
-     (tls/server-socket tls-context bind port))))
+     #?(:clj (tls/server-socket tls-context bind port)
+        :clje (tls-unsupported)))))
 
 ;; Unix domain sockets
 
@@ -130,9 +131,7 @@
      [{:keys [host server-socket]} transport-scheme]
      (if-let [path (beam-socket/unix-path server-socket)]
        (str transport-scheme "+unix:" (filename/absname path))
-       (str transport-scheme
-            (when (beam-socket/tls? server-socket) "s")
-            "://" host ":" (beam-socket/local-port server-socket)))))
+       (str transport-scheme "://" host ":" (beam-socket/local-port server-socket)))))
 
 (defprotocol Acceptable
   (accept [s]
@@ -166,9 +165,7 @@
    (extend-protocol Acceptable
      ServerSocket
      (accept [s]
-       (if (beam-socket/tls? s)
-         (tls/accept s)
-         (beam-socket/accept s)))))
+       (beam-socket/accept s))))
 
 (defprotocol Connectable
   (is-connected? [s]

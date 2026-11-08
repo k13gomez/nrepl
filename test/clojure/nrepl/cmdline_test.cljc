@@ -1,10 +1,11 @@
 (ns nrepl.cmdline-test
   {:author "Chas Emerick"}
+  #?(:clje (:refer-clojure :exclude [format with-redefs]))
   (:require
-   [clojure.java.io :refer [as-file]]
+   #?(:clj [clojure.java.io :refer [as-file]])
    [clojure.string :as str]
    [clojure.test :refer :all]
-   [com.github.ivarref.locksmith :as locksmith]
+   #?(:clj [com.github.ivarref.locksmith :as locksmith])
    [matcher-combinators.matchers :as m]
    [nrepl.ack :as ack]
    [nrepl.cmdline :as cmd]
@@ -13,13 +14,24 @@
    [nrepl.middleware :as middleware]
    [nrepl.server :as server]
    [nrepl.socket :refer [as-nrepl-uri unix-domain-flavor]]
-   [nrepl.test-helpers :refer [eval-value1 free-port is+ win? with-process with-timeout]]
-   [nrepl.transport :as transport])
-  (:import
-   (clojure.lang LineNumberingPushbackReader)
-   (java.lang ProcessBuilder$Redirect)
-   (java.nio.file Files)
-   (nrepl.server Server)))
+   [nrepl.test-helpers :refer [eval-value1 free-port is+ win? #?(:clj with-process) with-timeout]]
+   [nrepl.transport :as transport]
+   #?(:clje [nrepl.beam.compat :refer [format]]))
+  #?(:clj
+     (:import
+      (clojure.lang LineNumberingPushbackReader)
+      (java.lang ProcessBuilder$Redirect)
+      (java.nio.file Files)
+      (nrepl.server Server))))
+
+#?(:clje
+   (defmacro with-redefs
+     "Run `body` with the vars in `bindings` bound to new values. clojerl
+  has no `with-redefs`, so this binds the vars. It works only for dynamic
+  vars, such as `cmd/clean-up-and-exit` and `cmd/die` on the BEAM."
+     [bindings & body]
+     `(with-bindings ~(into {} (map (fn [[sym v]] [(list 'var sym) v])) (partition 2 bindings))
+        ~@body)))
 
 (defn wrap-dummy [handler]
   (fn [msg] (handler msg)))
@@ -28,16 +40,25 @@
                             {:requires #{}
                              :expects #{}})
 
-(defn create-tmpdir
+(#?(:clj defn :clje comment) create-tmpdir
   "Creates a temporary directory in parent (something clojure.java.io/as-path
   can handle) and returns its Path."
   [parent prefix]
   (let [nio-path (.toPath (as-file parent))]
     (Files/createTempDirectory nio-path prefix (into-array java.nio.file.attribute.FileAttribute []))))
 
+#?(:clje
+   (defn create-tmpdir
+     "Create a new directory in the directory `parent`, and return its path."
+     [parent prefix]
+     (let [path (str parent "/" prefix (erlang/unique_integer #erl(:positive)))]
+       (filelib/ensure_dir (str path "/"))
+       (file/make_dir path)
+       path)))
+
 (defn- run-f-with-server-and-every-transport [server-opts-fn f]
   (doseq [transport-fn transport-fns]
-    (with-open [^Server server
+    (with-open [^#?(:clj Server :clje erlang.Type) server
                 (apply server/start-server
                        (apply concat (assoc (if server-opts-fn (server-opts-fn) {})
                                             :transport-fn transport-fn
@@ -74,7 +95,7 @@
                               :handler ":handler"
                               :transport ":transport"})))
 
-(deftest args->cli-options
+(#?(:clj deftest :clje comment) args->cli-options
   (is+ [{:middleware :middleware :repl "true"} ["extra" "args"]]
        (cmd/args->cli-options ["-m" ":middleware" "-r" "true" "extra" "args"]))
 
@@ -111,7 +132,7 @@
                              :host "0.0.0.0"
                              :transport nil})))
 
-(deftest server-opts
+(#?(:clj deftest :clje comment) server-opts
   (is+ {:bind "0.0.0.0"
         :port 5000
         :transport #'transport/bencode
@@ -153,7 +174,7 @@
       (is+ #"nREPL server started on port \d+ on host localhost - .*//localhost:\d+"
            (cmd/server-started-message server {:transport #'transport/bencode})))))
 
-(deftest ^:slow ack
+(#?(:clj deftest :clje comment) ^:slow ack
   (with-server-every-transport nil
     (with-process [_ ["java" "-Dnreplacktest=y"
                       "-cp" (System/getProperty "java.class.path")
@@ -169,7 +190,7 @@
               ;; just a sanity check
               (is (= "y" (eval-value1 client '(System/getProperty "nreplacktest")))))))))))
 
-(deftest ^:slow explicit-port-argument
+(#?(:clj deftest :clje comment) ^:slow explicit-port-argument
   (with-server-every-transport nil
     (let [ack-port (:port *server*)
           bind-port (free-port)]
@@ -188,7 +209,8 @@
                                             "(binding [*dyn* 2] *dyn*)"])
             expected-output ["#'user/*dyn*" "2"]
             >devnull        (fn [& _] nil)]
-        (binding [*in* (java.io.PushbackReader. (java.io.StringReader. test-input))]
+        (binding [*in* #?(:clj (java.io.PushbackReader. (java.io.StringReader. test-input))
+                          :clje (erlang.io.PushbackReader. (erlang.io.StringReader. test-input)))]
           (with-redefs [cmd/clean-up-and-exit >devnull]
             (let [results (atom [])]
               (with-timeout 60000
@@ -205,12 +227,13 @@
   ;; text to the server, so reader context that exists only in the server
   ;; session (aliases, data readers) doesn't matter on the client, and broken
   ;; input can't kill the REPL.
-  (with-open [^Server server (server/start-server :handler (server/default-handler))]
+  (with-open [^#?(:clj Server :clje erlang.Type) server (server/start-server :handler (server/default-handler))]
     (let [drive (fn [input]
                   (let [>devnull (fn [& _] nil)
                         values (atom [])
                         errors (atom "")]
-                    (binding [*in* (java.io.StringReader. input)]
+                    (binding [*in* #?(:clj (java.io.StringReader. input)
+                                      :clje (erlang.io.PushbackReader. (erlang.io.StringReader. input)))]
                       (with-redefs [cmd/clean-up-and-exit >devnull]
                         (with-timeout 60000
                           (#'cmd/run-repl "127.0.0.1" (:port server)
@@ -222,7 +245,8 @@
       (testing "a reader typo doesn't kill the session"
         (let [{:keys [values errors]} (drive ")\n(+ 1 2)")]
           (is (= ["3"] values))
-          (is (str/includes? errors "Unmatched delimiter"))))
+          ;; The clojerl reader error text has this typo.
+          (is (str/includes? errors #?(:clj "Unmatched delimiter" :clje "Umatched delimiter")))))
       (testing "tagged literals unknown to the client are read by the server"
         (let [{:keys [values errors]} (drive "#nosuch/tag 42\n(+ 1 2)")]
           (is (= ["3"] values))
@@ -233,7 +257,7 @@
       (testing "multi-line forms work"
         (is (= ["3"] (:values (drive "(+ 1\n2)")))))
       (testing "reader conditionals are passed through to the server"
-        (is (= ["1"] (:values (drive "#?(:clj 1 :cljs 2)")))))
+        (is (= ["1"] (:values (drive #?(:clj "#?(:clj 1 :cljs 2)" :clje "#?(:clje 1 :cljs 2)"))))))
       (testing "#_ discard is sent along with the following form"
         (is (= ["42"] (:values (drive "#_(/ 1 0) 42")))))
       (testing "metadata reaches the server without client-side re-printing"
@@ -243,12 +267,12 @@
       (testing "after a reader error the rest of the line is discarded (not re-read)"
         ;; `)foo` must not sneak `foo` through to the server as a real eval.
         (let [{:keys [values errors]} (drive ")foo\n(+ 1 2)")]
-          (is (str/includes? errors "Unmatched delimiter"))
+          (is (str/includes? errors #?(:clj "Unmatched delimiter" :clje "Umatched delimiter")))
           (is (= ["3"] values))))
       (testing "EOF in the middle of a form ends the loop instead of hanging"
         (is (= ["3"] (:values (drive "(+ 1 2)\n(+ 4"))))))))
 
-(deftest read-form-for-server-passthrough
+(#?(:clj deftest :clje comment) read-form-for-server-passthrough
   ;; The client reads only to find the form boundary; literals that would
   ;; throw under *read-eval* false (records, #=) or that the client can't
   ;; resolve (aliased keywords, unknown tags) are read inertly and their
@@ -301,13 +325,13 @@
   (testing "telnet is rejected, since the built-in client can't drive a tty transport"
     (let [died (fn [& msg] (throw (ex-info (apply str msg) {})))]
       (with-redefs [cmd/die died]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not support the tty transport"
+        (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :clje clojerl.ExceptionInfo) #"does not support the tty transport"
                               (#'cmd/ensure-url-scheme-support! "telnet"))))))
   (testing "http(s) needs drawbridge, which isn't on the test classpath"
     (let [died (fn [& msg] (throw (ex-info (apply str msg) {})))]
       (with-redefs [cmd/die died]
         (doseq [scheme ["http" "https"]]
-          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires the nrepl/drawbridge library"
+          (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :clje clojerl.ExceptionInfo) #"requires the nrepl/drawbridge library"
                                 (#'cmd/ensure-url-scheme-support! scheme))))))))
 
 (deftest unix-socket-url-test
@@ -326,7 +350,7 @@
   (let [died (fn [& msg] (throw (ex-info (apply str msg) {})))]
     (with-redefs [cmd/die died]
       (are [opts pattern] (thrown-with-msg?
-                           clojure.lang.ExceptionInfo pattern
+                           #?(:clj clojure.lang.ExceptionInfo :clje clojerl.ExceptionInfo) pattern
                            (#'cmd/reject-conflicting-url-options! "nrepl://h:1" opts))
         {:socket "/tmp/s"}            #"--socket can't be combined"
         {:port 12345}                 #"--port can't be combined"
@@ -335,7 +359,7 @@
         (is (nil? (#'cmd/reject-conflicting-url-options!
                    "nrepl://h:1" {:transport #'transport/bencode})))))))
 
-(deftest tls-url-option-validation
+(#?(:clj deftest :clje comment) tls-url-option-validation
   (let [died (fn [& msg] (throw (ex-info (apply str msg) {})))]
     (with-redefs [cmd/die died]
       (are [url opts re] (thrown-with-msg? clojure.lang.ExceptionInfo re
@@ -351,7 +375,7 @@
         ;; ... as are out-of-range ports
         "nrepls://localhost:444401"    {:tls-keys-str "irrelevant"} #"Invalid port"))))
 
-(deftest can-connect-via-tls-url
+(#?(:clj deftest :clje comment) can-connect-via-tls-url
   (if win?
     ;; TLS is not exercised on Windows (see nrepl.tls-test); assert something
     ;; so the test isn't reported as running without assertions.
@@ -368,7 +392,8 @@
           (let [url (str (as-nrepl-uri server (transport/uri-scheme transport-fn)))
                 >devnull (fn [& _] nil)
                 results (atom [])]
-            (binding [*in* (java.io.PushbackReader. (java.io.StringReader. "(+ 1 2)"))]
+            (binding [*in* #?(:clj (java.io.PushbackReader. (java.io.StringReader. "(+ 1 2)"))
+                              :clje (erlang.io.PushbackReader. (erlang.io.StringReader. "(+ 1 2)")))]
               (with-redefs [cmd/clean-up-and-exit >devnull]
                 (with-timeout 60000
                   (#'cmd/run-repl url nil
@@ -388,7 +413,8 @@
                              (:host *server*)
                              (:port *server*))
             >devnull (fn [& _] nil)]
-        (binding [*in* (java.io.PushbackReader. (java.io.StringReader. "(+ 1 2)"))]
+        (binding [*in* #?(:clj (java.io.PushbackReader. (java.io.StringReader. "(+ 1 2)"))
+                          :clje (erlang.io.PushbackReader. (erlang.io.StringReader. "(+ 1 2)")))]
           (with-redefs [cmd/clean-up-and-exit >devnull]
             (let [results (atom [])]
               (with-timeout 60000
@@ -401,7 +427,7 @@
 
 ;;; Unix domain socket tests
 
-(defn send-unix-socket-message [message path]
+(#?(:clj defn :clje comment) send-unix-socket-message [message path]
   (with-open [sock (nrepl.socket/unix-client-socket path)]
     ;; Assume it's safe to use Channels input/output streams here since
     ;; we're never reading and writing at the same time.
@@ -410,12 +436,12 @@
       (#'transport/safe-write-bencode out message)
       (.flush ^java.io.Flushable out))))
 
-(defn socket-file-connectable? [sock-path]
+(#?(:clj defn :clje comment) socket-file-connectable? [sock-path]
   (try (with-open [^java.io.Closeable _ (nrepl.socket/unix-client-socket sock-path)]
          true)
        (catch Exception _ false)))
 
-(deftest ^:slow basic-fs-socket-behavior
+(#?(:clj deftest :clje comment) ^:slow basic-fs-socket-behavior
   (when (is unix-domain-flavor)
     (let [tmpdir (create-tmpdir "target" "socket-test-")
           sock-path (str tmpdir "/socket")
@@ -446,8 +472,9 @@
                                          "(ns a)" "::a"
                                          "(ns b)" "::a"
                                          "(ns user)" "::a"
-                                         "(require '[a :as z])" "::z/a"])
-          expected-output [(str (keyword (str *ns*) "a"))
+                                         ;; clojerl cannot require a namespace that only an eval created.
+                                         #?(:clj "(require '[a :as z])" :clje "(do (alias 'z 'a) nil)") "::z/a"])
+          expected-output [(str (keyword #?(:clj (str *ns*) :clje "user") "a"))
                            "nil" ":a/a"
                            "nil" ":b/a"
                            "nil" ":user/a"
@@ -455,7 +482,8 @@
           >devnull (fn [& _] nil)]
       (with-redefs [cmd/clean-up-and-exit >devnull]
         (with-server-every-transport nil
-          (binding [*in* (java.io.PushbackReader. (java.io.StringReader. test-input))]
+          (binding [*in* #?(:clj (java.io.PushbackReader. (java.io.StringReader. test-input))
+                            :clje (erlang.io.PushbackReader. (erlang.io.StringReader. test-input)))]
             (let [results (atom [])]
               (with-timeout 60000
                 (#'cmd/run-repl (:host *server*) (:port *server*)
@@ -473,8 +501,9 @@
                                                 "(ns a)" "::a"
                                                 "(ns b)" "::a"
                                                 "(ns user)" "::a"
-                                                "(require '[a :as z])" "::z/a"])
-            expected-output [(str (keyword (str *ns*) "a"))
+                                                ;; clojerl cannot require a namespace that only an eval created.
+                                                #?(:clj "(require '[a :as z])" :clje "(do (alias 'z 'a) nil)") "::z/a"])
+            expected-output [(str (keyword #?(:clj (str *ns*) :clje "user") "a"))
                              "nil" ":a/a"
                              "nil" ":b/a"
                              "nil" ":user/a"
@@ -482,7 +511,8 @@
             >devnull        (fn [& _] nil)]
         (with-redefs [cmd/clean-up-and-exit >devnull]
           (with-server-every-transport (fn [] {:socket (str (create-tmpdir "target" "socket-test-") "/socket")})
-            (binding [*in* (java.io.PushbackReader. (java.io.StringReader. test-input))]
+            (binding [*in* #?(:clj (java.io.PushbackReader. (java.io.StringReader. test-input))
+                              :clje (erlang.io.PushbackReader. (erlang.io.StringReader. test-input)))]
               (let [results (atom [])]
                 (with-timeout 60000
                   (#'cmd/run-repl {:server  *server*
@@ -492,3 +522,69 @@
                                              :out >devnull
                                              :value #(swap! results conj %)}}))
                 (is (= expected-output @results))))))))))
+
+;;; The BEAM versions of tests above that differ on the BEAM.
+
+;; On the BEAM, the config is computed at the first call and kept. A test
+;; cannot replace it, so only the tests without a config change are here.
+#?(:clje
+   (deftest args->cli-options
+     (is+ [{:middleware :middleware :repl "true"} ["extra" "args"]]
+          (cmd/args->cli-options ["-m" ":middleware" "-r" "true" "extra" "args"]))
+     (is+ [{:middleware '[baz/middleware]} []]
+          (cmd/args->cli-options ["-m" "^:concat [baz/middleware]"]))))
+
+;; clojerl functions cannot carry metadata, so the handler has no :stack.
+;; These tests check the resolved middleware list.
+#?(:clje
+   (deftest server-opts
+     (is+ {:bind "0.0.0.0"
+           :port 5000
+           :transport #'transport/bencode
+           :handler #'clojure.core/identity
+           :repl-fn #'clojure.core/identity
+           :greeting nil
+           :ack-port 2000}
+          (cmd/server-opts {:bind "0.0.0.0"
+                            :port 5000
+                            :ack 2000
+                            :handler 'clojure.core/identity
+                            :repl-fn 'clojure.core/identity}))
+     (testing "middleware resolution"
+       (testing "keeps optional middleware that is present"
+         (is (= [#'nrepl.cmdline-test/wrap-dummy]
+                (#'cmd/->mw-list [(with-meta 'nrepl.cmdline-test/wrap-dummy {:optional true})]))))
+       (testing "drops optional middleware that is missing"
+         (is (= [] (#'cmd/->mw-list [(with-meta 'nonexistent/middleware {:optional true})]))))
+       (testing "required middleware missing still fails"
+         (is (thrown? _ (cmd/server-opts {:middleware ['nonexistent/required]})))))))
+
+;; The BEAM client finds form boundaries with a lexer and never reads the
+;; form. So `#=` and record literals reach the server as text.
+#?(:clje
+   (deftest read-form-for-server-passthrough
+     (let [read-one (fn [s]
+                      (#'cmd/read-form-for-server
+                       (erlang.io.PushbackReader. (erlang.io.StringReader. s))))]
+       (are [input expected-code] (= expected-code (:code (read-one input)))
+         "#clojure.lang.PersistentQueue[]" "#clojure.lang.PersistentQueue[]"
+         "#nosuch/tag 42"                  "#nosuch/tag 42"
+         "::zzz/foo"                       "::zzz/foo"
+         "(+ 1\n  2)"                      "(+ 1\n  2)"
+         "#=(nrepl.cmdline-test/mark-ran)" "#=(nrepl.cmdline-test/mark-ran)")
+       (testing "only the first form is consumed, leaving the rest for the next read"
+         (let [rdr (erlang.io.PushbackReader. (erlang.io.StringReader. "(+ 1 2) (+ 3 4)"))]
+           (is (= "(+ 1 2)" (:code (#'cmd/read-form-for-server rdr))))
+           (is (= "(+ 3 4)" (:code (#'cmd/read-form-for-server rdr))))
+           (is (= :nrepl.cmdline/eof (#'cmd/read-form-for-server rdr))))))))
+
+;; The BEAM build has no TLS support. A TLS URL exits with an error.
+#?(:clje
+   (deftest tls-url-option-validation
+     (let [died (fn [& msg] (throw (ex-info (apply str msg) {})))]
+       (with-redefs [cmd/die died]
+         (are [url opts re] (thrown-with-msg? clojerl.ExceptionInfo re
+                                              (#'cmd/run-repl url nil opts))
+           "nrepls://localhost:12345"     {}                           #"TLS is not supported on the BEAM"
+           "nrepl+edns://localhost:12345" {:tls-keys-str "irrelevant"} #"TLS is not supported on the BEAM"
+           "nrepl://localhost:12345"      {:tls-keys-str "irrelevant"} #"only supported for")))))

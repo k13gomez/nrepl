@@ -13,10 +13,10 @@
    nrepl.middleware.session
    [nrepl.misc :refer [log log-exceptions response-for]]
    [nrepl.socket :as socket :refer [inet-socket unix-server-socket]]
-   [nrepl.tls :as tls]
+   #?(:clj [nrepl.tls :as tls])
    [nrepl.transport :as t]
    [nrepl.util.threading :as threading]
-   #?@(:clje [[nrepl.beam.compat :refer [descriptor-of requiring-resolve]]
+   #?@(:clje [[nrepl.beam.compat :refer [descriptor-of requiring-resolve tls-unsupported]]
               [nrepl.beam.socket :as beam-socket]]))
   #?(:clj
      (:import
@@ -102,35 +102,25 @@
                          (socket/accept server-socket)
                          (catch _ e
                            (consume-exception e)
-                           (cond
-                             ;; A closed server socket stops the loop.
-                             (beam-socket/disconnected? e)
-                             nil
-
-                             ;; A failed TLS handshake, e.g. a bad client cert,
-                             ;; skips the client but continues the loop.
-                             (beam-socket/tls? server-socket)
-                             :tls-exception
-
-                             :else
-                             (do (log e "Unexpected exception in server loop")
-                                 (safe-close server-socket)
-                                 (log "Shutting down server abruptly")
-                                 nil))))]
-         (when-not (= sock :tls-exception)
-           (threading/run-with @threading/handle-executor
-             (log-exceptions
-              (let [transport (transport sock)]
-                (try
-                  (swap! open-transports conj transport)
-                  (when greeting (greeting transport))
-                  (handle handler transport)
-                  (catch _ e
-                    (when-not (t/disconnected? e)
-                      (throw e)))
-                  (finally
-                    (swap! open-transports disj transport)
-                    (safe-close transport)))))))
+                           ;; A closed server socket stops the loop.
+                           (when-not (beam-socket/disconnected? e)
+                             (log e "Unexpected exception in server loop")
+                             (safe-close server-socket)
+                             (log "Shutting down server abruptly"))
+                           nil))]
+         (threading/run-with @threading/handle-executor
+           (log-exceptions
+            (let [transport (transport sock)]
+              (try
+                (swap! open-transports conj transport)
+                (when greeting (greeting transport))
+                (handle handler transport)
+                (catch _ e
+                  (when-not (t/disconnected? e)
+                    (throw e)))
+                (finally
+                  (swap! open-transports disj transport)
+                  (safe-close transport))))))
          (recur)))))
 
 (defn stop-server
@@ -264,7 +254,8 @@
         ss (cond socket
                  (unix-server-socket socket)
                  (or tls? tls-keys-str tls-keys-file)
-                 (inet-socket bind port (tls/ssl-context-or-throw tls-keys-str tls-keys-file))
+                 (inet-socket bind port #?(:clj (tls/ssl-context-or-throw tls-keys-str tls-keys-file)
+                                           :clje (tls-unsupported)))
                  :else
                  (inet-socket bind port))
         server (Server. ss

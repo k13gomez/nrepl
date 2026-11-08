@@ -5,7 +5,8 @@
   The input lives in a stdin process, because the `stdin` op adds input from
   one process while the eval reads in another. A read runs in the calling
   process. So the need-input callback sees the bindings of the eval, such as
-  `nrepl.middleware.interruptible-eval/*msg*`.")
+  `nrepl.middleware.interruptible-eval/*msg*`."
+  (:require [clojure.erlang.io :as io]))
 
 (defn- utf8-length [b]
   (cond
@@ -136,10 +137,37 @@
           (call pid (fn [from] #erl[:wait from])))
       ch)))
 
+;; clojerl `slurp` and `clojure.erlang.io/copy` support only files. These
+;; let `(slurp *in*)` read the session input to its end, as on the JVM.
+
+(extend-type QueuePollingReader
+  io/IOFactory
+  (make-reader [this _] this)
+  (make-writer [this _]
+    (throw (clojerl.BadArgumentError. "Cannot open the session input as a Writer."))))
+
+(defn- copy-input [input output _]
+  (loop []
+    (let [s (erlang.io.IReader/read input 1024)]
+      (when-not (= :eof s)
+        (erlang.io.IWriter/write output s)
+        (recur)))))
+
+(defn- add-copy-method!
+  "Add the `do-copy` method for the session input, once. `do-copy` is
+  private, so `defmethod` cannot reach it. An `erl-on-load*` hook cannot
+  add it: the hook runs while the clojerl namespace server loads this
+  module, and the call back into that server deadlocks."
+  []
+  (when-not (persistent_term/get ::copy-method false)
+    (clj_multimethod/add_method #'io/do-copy [QueuePollingReader erlang.io.StringWriter] copy-input)
+    (persistent_term/put ::copy-method true)))
+
 (defn queue-polling-reader
   "Return a new reader that calls `send-need-input-request` when a read
   finds no input. Call `add-input` or `add-eof` to give it input."
   [send-need-input-request]
+  (add-copy-method!)
   (QueuePollingReader.
    (erlang/spawn (fn [] (stdin-loop {:buf nil :pending [] :waiters []})))
    send-need-input-request))

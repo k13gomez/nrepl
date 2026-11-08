@@ -6,7 +6,7 @@
    [nrepl.test-helpers :as th]
    [nrepl.transport :as transport :refer [piped-transports]]))
 
-(deftest repl-out-writer
+(#?(:clj deftest :clje comment) repl-out-writer
   (let [[local remote] (piped-transports)
         w (print/replying-PrintWriter :out {:transport remote} {})]
     (doto w
@@ -30,3 +30,30 @@
             (th/newline->sys "\n#{}\n")]
            (->> (nrepl/response-seq local 0)
                 (map :out))))))
+
+;; On the BEAM a writer takes strings through erlang.io.IWriter, and an
+;; empty string is a flush.
+#?(:clje
+   (deftest repl-out-writer
+     (let [[local remote] (piped-transports)
+           w (print/replying-PrintWriter :out {:transport remote} {})]
+       (doto w
+         (erlang.io.IWriter/write "")
+         (erlang.io.IWriter/write "println\n")
+         (erlang.io.IWriter/write "abcd")
+         (erlang.io.IWriter/write "ef")
+         (erlang.io.IWriter/write " ")
+         (erlang.io.IWriter/write ""))
+       (binding [*out* w]
+         (newline)
+         (prn #{})
+         (flush))
+       (.close w)
+       ;; The JVM test buffers in a PrintWriter until the flush. Here each
+       ;; newline sends the text before it.
+       (is (= ["println\n"
+               "abcdef "
+               "\n"
+               "#{}\n"]
+              (->> (nrepl/response-seq local 0)
+                   (map :out)))))))

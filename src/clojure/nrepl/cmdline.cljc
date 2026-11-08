@@ -38,7 +38,8 @@
      (some-> @port-file file/delete)
      (beam-socket/delete-unix-socket-files!)))
 
-(defn- clean-up-and-exit
+;; clojerl has no `with-redefs`, so the BEAM tests rebind this var and `die`.
+(defn- ^#?(:clj {} :clje {:dynamic true}) clean-up-and-exit
   "Performs any necessary clean up and calls `(System/exit status)`."
   [status]
   #?(:clj (shutdown-agents) :clje (delete-port-file))
@@ -54,7 +55,7 @@
   ;; clojerl ex-info needs a message.
   (throw (ex-info #?(:clj nil :clje "") {:nrepl/kind ::exit ::status status})))
 
-(defn die
+(defn ^#?(:clj {} :clje {:dynamic true}) die
   "`Print`s items in `msg` to *err* and then exits with a status of 2."
   [& msg]
   (binding [*out* *err*]
@@ -355,28 +356,9 @@ Exit:      Control+D or (exit) or (quit)")
 
 #?(:clje
    (defn- tls-url-connect
-     "Connects to a TLS URL (see `tls-url-transports`), as advertised in a
-  TLS-enabled server's startup message. The TLS keys must be supplied
-  separately via the `:tls-keys-file`/`:tls-keys-str` options."
-     [url scheme {:keys [tls-keys-file tls-keys-str]}]
-     (when-not (or tls-keys-file tls-keys-str)
-       (die (format "nREPL: %s:// URLs require --tls-keys-file or --tls-keys-str.\n" scheme)))
-     (let [uri (uri_string/parse url)
-           _ (when (erlang/is_tuple uri)
-               (die (format "nREPL: Invalid URL %s.\n" url)))
-           host (get uri :host)
-           port (get uri :port 0)]
-       (when-not (seq host)
-         (die (format "nREPL: Can't extract a host from the URL %s.\n" url)))
-       (when (> port 65535)
-         (die (format "nREPL: Invalid port %d in URL %s.\n" port url)))
-       (nrepl/connect :host host
-                      ;; The same default port nrepl.core/url-connect uses for
-                      ;; the other nrepl schemes.
-                      :port (if (pos? port) port 7888)
-                      :transport-fn (tls-url-transports scheme)
-                      :tls-keys-file tls-keys-file
-                      :tls-keys-str tls-keys-str))))
+     "Exit with an error. The BEAM build has no TLS support yet."
+     [_url _scheme _options]
+     (die "nREPL: TLS is not supported on the BEAM.\n")))
 
 (defn- run-repl
   ([{:keys [server options]}]

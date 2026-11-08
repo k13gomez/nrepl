@@ -8,13 +8,14 @@
    [nrepl.middleware :as middleware]
    [nrepl.server :as server]
    [nrepl.test-helpers :refer [is+]]
-   [nrepl.version :as version]))
+   [nrepl.version :as version]
+   #?(:clje [nrepl.beam.compat :refer [descriptor-of]])))
 
 (use-fixtures :once repl-server-fixture)
 
 (def built-in-ops
   (->> (conj server/default-middleware #'middleware/wrap-describe)
-       (map #(-> % meta :nrepl.middleware/descriptor :handles keys))
+       (map #(-> % #?(:clj meta :clje descriptor-of) #?@(:clj [:nrepl.middleware/descriptor]) :handles keys))
        (reduce concat)
        set))
 
@@ -22,7 +23,8 @@
   (is+ {:versions {:nrepl (#'middleware/safe-version version/version)
                    :clojure (assoc (#'middleware/safe-version *clojure-version*)
                                    :version-string (clojure-version))
-                   :java {:version-string (System/getProperty "java.version")}}
+                   #?@(:clj [:java {:version-string (System/getProperty "java.version")}]
+                       :clje [:erlang {:version-string (erlang/list_to_binary (erlang/system_info :otp_release))}])}
         :ops (mc/all-of (mc/via #(set (map name (keys %))) built-in-ops)
                         (fn [ops]
                           (every? empty? (vals ops))))

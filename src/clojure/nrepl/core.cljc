@@ -5,10 +5,10 @@
   (:require
    [nrepl.misc :refer [take-until uuid]]
    [nrepl.socket :as socket]
-   [nrepl.tls :as tls]
+   #?(:clj [nrepl.tls :as tls])
    [nrepl.transport :as transport]
    [nrepl.version :as version]
-   #?@(:clje [[nrepl.beam.compat :refer [fn-with-meta format]]
+   #?@(:clje [[nrepl.beam.compat :refer [fn-with-meta format tls-unsupported]]
               [nrepl.beam.socket :as beam-socket]])))
 
 ;; clojerl lazy seqs do not cache their values. Each traversal calls the
@@ -23,7 +23,9 @@
      "Serve messages of `transport` by index. `msgs` holds the received ones.
   `end` is the index where a recv timed out, so the seqs end there.
   `waiters` wait for message (count msgs), which a helper process receives,
-  so the fetcher can still answer a new head while a recv waits."
+  so the fetcher can still answer a new head while a recv waits. A recv
+  error goes to the waiters, and `fetcher-call` throws it, as a JVM recv
+  throws to the reader of the seq."
      [transport msgs end waiters]
      (let [reply (fn [[from ref] v] (erlang/send from #erl[ref v]))
            self (erlang/self)]
@@ -35,7 +37,9 @@
           (= i end) (do (reply [from ref] nil)
                         (recur transport msgs end waiters))
           :else (do (when (empty? waiters)
-                      (erlang/spawn (fn [] (erlang/send self #erl[:received (transport/recv transport timeout)]))))
+                      (erlang/spawn (fn []
+                                      (erlang/send self (try #erl[:received (transport/recv transport timeout)]
+                                                             (catch _ e #erl[:failed e]))))))
                     (recur transport msgs end (conj waiters [from ref]))))
 
         #erl[:received resp]
@@ -43,6 +47,10 @@
             (if (some? resp)
               (recur transport (conj msgs resp) end [])
               (recur transport msgs (count msgs) [])))
+
+        #erl[:failed e]
+        (do (run! #(reply % #erl[::failed e]) waiters)
+            (recur transport msgs end []))
 
         #erl[:head from ref]
         ;; A new head starts at the first message no seq has taken. After a
@@ -60,7 +68,10 @@
      (let [ref (erlang/monitor :process fetcher)]
        (erlang/send fetcher (request (erlang/self) ref))
        (receive*
-        #erl[ref value] (do (erlang/demonitor ref #erl(:flush)) value)
+        #erl[ref value] (do (erlang/demonitor ref #erl(:flush))
+                            (if (and (erlang/is_tuple value) (= ::failed (erlang/element 1 value)))
+                              (throw (erlang/element 2 value))
+                              value))
         #erl[:DOWN ref _ _ _] nil))))
 
 #?(:clje
@@ -242,10 +253,14 @@
        combine-responses
        :value))
 
-(defn- tls-connect
+(#?(:clj defn- :clje comment) tls-connect
   [{:keys [port host transport-fn tls-keys-str tls-keys-file]}]
   (let [tls-context (tls/ssl-context-or-throw tls-keys-str tls-keys-file)]
-    (transport-fn (tls/socket tls-context ^#?(:clj String :clje erlang.Type) host (int port) 10000))))
+    (transport-fn (tls/socket tls-context ^String host (int port) 10000))))
+
+#?(:clje
+   (defn- tls-connect [_]
+     (tls-unsupported)))
 
 (defn connect
   "Connects to a socket-based REPL at the given host (defaults to 127.0.0.1) and port

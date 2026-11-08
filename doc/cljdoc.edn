@@ -9,7 +9,8 @@
    ["Server" {:file "doc/modules/ROOT/pages/usage/server.adoc"}]
    ["Client" {:file "doc/modules/ROOT/pages/usage/clients.adoc"}]
    ["TLS" {:file "doc/modules/ROOT/pages/usage/tls.adoc"}]
-   ["Misc" {:file "doc/modules/ROOT/pages/usage/misc.adoc"}]]
+   ["Misc" {:file "doc/modules/ROOT/pages/usage/misc.adoc"}]
+   ["BEAM (clojerl)" {:file "doc/modules/ROOT/pages/usage/beam.adoc"}]]
   ["Design" {}
    ["Overview" {:file "doc/modules/ROOT/pages/design/overview.adoc"}]
    ["Handlers" {:file "doc/modules/ROOT/pages/design/handlers.adoc"}]

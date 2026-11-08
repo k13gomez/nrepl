@@ -32,7 +32,9 @@ clje-compile:
 # ported tests here.
 CLJE_TEST_NS ?= nrepl.bencode-test nrepl.middleware.session-test nrepl.util.out-test \
 	nrepl.middleware.interruptible-eval-test nrepl.middleware.load-file-test nrepl.middleware.print-test \
-	nrepl.middleware.completion-test nrepl.middleware.lookup-test nrepl.util.completion-test nrepl.util.lookup-test
+	nrepl.middleware.completion-test nrepl.middleware.lookup-test nrepl.util.completion-test nrepl.util.lookup-test \
+	nrepl.misc-test nrepl.response-test nrepl.edn-test nrepl.describe-test nrepl.sanity-test nrepl.socket-test \
+	nrepl.transport-test nrepl.middleware-test nrepl.core-test nrepl.cmdline-test nrepl.cmdline-tty-test
 
 # Builds _build/escript/bin/nrepl, which runs nrepl.cmdline.
 clje-escript:

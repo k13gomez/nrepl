@@ -6,6 +6,5 @@
 
 main(Args) ->
   ok = clojerl:start(),
-  {ok, _} = application:ensure_all_started(ssl),
   BinArgs = [unicode:characters_to_binary(Arg) || Arg <- Args],
   'clojure.main':main([<<"-m">>, <<"nrepl.cmdline">> | BinArgs]).

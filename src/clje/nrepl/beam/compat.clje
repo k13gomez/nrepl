@@ -211,3 +211,8 @@
   []
   (let [[[dir]] (erlang/element 2 (init/get_argument :home))]
     (erlang/list_to_binary dir)))
+
+(defn tls-unsupported
+  "Throw the error for a TLS request. The BEAM build has no TLS support yet."
+  []
+  (throw (ex-info "TLS is not supported on the BEAM." {:nrepl/kind :nrepl/tls-unsupported})))

@@ -1,20 +1,23 @@
 (ns nrepl.tls-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
-            [com.github.ivarref.locksmith :as locksmith]
+            #?(:clj [com.github.ivarref.locksmith :as locksmith])
             [nrepl.core :as nrepl]
             [nrepl.server :as server]
             [nrepl.socket :as socket]
             [nrepl.test-helpers :refer [eval-value1 win?]]
-            [nrepl.tls :as tls]
-            [nrepl.tls-client-proxy :as tls-client-proxy]
+            #?@(:clj [[nrepl.tls :as tls]
+                      [nrepl.tls-client-proxy :as tls-client-proxy]])
             [nrepl.transport :as transport])
-  (:import (clojure.lang ExceptionInfo)
-           (java.lang AutoCloseable)
-           (java.net InetSocketAddress Socket)
-           (javax.net.ssl SSLException SSLHandshakeException)))
+  #?(:clj
+     (:import (clojure.lang ExceptionInfo)
+              (java.lang AutoCloseable)
+              (java.net InetSocketAddress Socket)
+              (javax.net.ssl SSLException SSLHandshakeException))))
 
-(defn non-windows-fixture
+;; The BEAM build has no TLS support, so these tests run only on the JVM.
+
+(#?(:clj defn :clje comment) non-windows-fixture
   "TLS tests are currently broken on Windows, so we use this fixture to disable
   them there instead of messing with test selectors."
   [f]
@@ -22,23 +25,23 @@
     (is (= 2 (+ 1 1))) ;; Dummy assertion to make the test succeed.
     (f)))
 
-(use-fixtures :each non-windows-fixture)
+(#?(:clj use-fixtures :clje comment) :each non-windows-fixture)
 
-(defn gen-key-pair []
+(#?(:clj defn :clje comment) gen-key-pair []
   (let [{:keys [ca-cert server-cert server-key client-cert client-key]} (locksmith/gen-certs {:duration-days 1})]
     [(str ca-cert server-cert server-key)
      (str ca-cert client-cert client-key)]))
 
 ; Make sure TLS is in fact used
-(defn tls-connect
+(#?(:clj defn :clje comment) tls-connect
   ^AutoCloseable [opts]
   (#'nrepl/tls-connect opts))
 
-(defn println-err [& args]
+(#?(:clj defn :clje comment) println-err [& args]
   (binding [*out* *err*]
     (apply println args)))
 
-(defn noisy-deref [e]
+(#?(:clj defn :clje comment) noisy-deref [e]
   (let [dereffed (deref e 3000 :timeout)]
     (if (= :timeout dereffed)
       (do
@@ -47,11 +50,11 @@
         nil)
       dereffed)))
 
-(defn tls-socket-exception? [exception-promise]
+(#?(:clj defn :clje comment) tls-socket-exception? [exception-promise]
   (let [e (noisy-deref exception-promise)]
     (instance? SSLException e)))
 
-(deftest bad-config
+(#?(:clj deftest :clje comment) bad-config
   (is (thrown? ExceptionInfo (server/start-server :tls? true)))
   (is (= :nrepl.server/invalid-start-request
          (:nrepl/kind (try
@@ -59,7 +62,7 @@
                         (catch Throwable t
                           (ex-data t)))))))
 
-(defn- ctx-error
+(#?(:clj defn- :clje comment) ctx-error
   "Returns the ExceptionInfo thrown when creating a TLS context from
   `keys-str`, or nil if no exception was thrown."
   ^ExceptionInfo [keys-str]
@@ -69,7 +72,7 @@
     (catch ExceptionInfo e
       e)))
 
-(defn- is-ctx-error
+(#?(:clj defn- :clje comment) is-ctx-error
   "Asserts that creating a TLS context from `keys-str` fails with an error
   message containing all of `substrs`."
   [keys-str & substrs]
@@ -79,7 +82,7 @@
       (doseq [substr substrs]
         (is (str/includes? (.getMessage e) substr))))))
 
-(deftest descriptive-key-material-errors
+(#?(:clj deftest :clje comment) descriptive-key-material-errors
   (let [{:keys [ca-cert server-cert server-key]} (locksmith/gen-certs {:duration-days 1})]
     (testing "missing private key"
       (is-ctx-error (str ca-cert server-cert) "No private key found"))
@@ -115,7 +118,7 @@
       (let [e (ctx-error (str ca-cert server-cert))]
         (is (some? (.getCause e)))))))
 
-(deftest ed25519-private-key-parsing
+(#?(:clj deftest :clje comment) ed25519-private-key-parsing
   (if-let [^java.security.KeyPairGenerator kpg (try
                                                  (java.security.KeyPairGenerator/getInstance "Ed25519")
                                                  (catch java.security.NoSuchAlgorithmException _
@@ -128,7 +131,7 @@
     ;; Ed25519 needs Java 15+; nothing to test on older JDKs.
     (is true)))
 
-(deftest swapped-certificate-order
+(#?(:clj deftest :clje comment) swapped-certificate-order
   ;; The documented keys file layout is CA certificate first, own certificate
   ;; second, but the reverse order should be detected and handled.
   (let [{:keys [ca-cert server-cert server-key client-cert client-key]} (locksmith/gen-certs {:duration-days 1})
@@ -142,7 +145,7 @@
       (let [client (nrepl/client transport 30000)]
         (is (= 2 (eval-value1 client '(+ 1 1))))))))
 
-(deftest bad-keys
+(#?(:clj deftest :clje comment) bad-keys
   (let [[server-keys _] (gen-key-pair)
         [_ client-keys] (gen-key-pair)
         exception (promise)]
@@ -166,7 +169,7 @@
         (is (thrown? Exception (eval-value1 client '(+ 1 1))))
         (is (tls-socket-exception? exception))))))
 
-(deftest bad-keys-then-good
+(#?(:clj deftest :clje comment) bad-keys-then-good
   (let [[server-keys good-client-keys] (gen-key-pair)
         [_ bad-client-keys] (gen-key-pair)
         exception (promise)]
@@ -196,7 +199,7 @@
         (let [client (nrepl/client transport 30000)]
           (is (= 2 (eval-value1 client '(+ 1 1)))))))))
 
-(deftest bad-keys-then-good-no-consume-exception
+(#?(:clj deftest :clje comment) bad-keys-then-good-no-consume-exception
   (let [[server-keys good-client-keys] (gen-key-pair)
         [_ bad-client-keys] (gen-key-pair)]
     (with-open [server (server/start-server :tls? true
@@ -214,7 +217,7 @@
         (let [client (nrepl/client transport 30000)]
           (is (= 2 (eval-value1 client '(+ 1 1)))))))))
 
-(deftest conn-close-then-ok
+(#?(:clj deftest :clje comment) conn-close-then-ok
   (let [[server-keys good-client-keys] (gen-key-pair)]
     (with-open [server (server/start-server :tls? true
                                             :tls-keys-str server-keys)]
@@ -228,7 +231,7 @@
         (let [client (nrepl/client transport 30000)]
           (is (= 2 (eval-value1 client '(+ 1 1)))))))))
 
-(deftest happy-case
+(#?(:clj deftest :clje comment) happy-case
   (let [[server-keys client-keys] (gen-key-pair)]
     (with-open [server (server/start-server :tls? true :tls-keys-str server-keys)
                 transport (tls-connect {:tls-keys-str client-keys
@@ -238,7 +241,7 @@
       (let [client (nrepl/client transport 30000)]
         (is (= 2 (eval-value1 client '(+ 1 1))))))))
 
-(deftest accept-sets-tcp-nodelay
+(#?(:clj deftest :clje comment) accept-sets-tcp-nodelay
   (let [[server-keys client-keys] (gen-key-pair)]
     (with-open [server (tls/server-socket (tls/ssl-context-or-throw server-keys nil) "127.0.0.1" 0)]
       (let [client (future
@@ -248,7 +251,7 @@
                     ^Socket _client @client]
           (is (.getTcpNoDelay accepted)))))))
 
-(deftest regular-connection-times-out
+(#?(:clj deftest :clje comment) regular-connection-times-out
   (let [[server-keys _] (gen-key-pair)
         exception (promise)]
     (with-redefs [tls/*handshake-timeout-ms* 300]
@@ -258,7 +261,7 @@
                   ^AutoCloseable _ (nrepl/connect :port (:port server))]
         (is (tls-socket-exception? exception))))))
 
-(deftest regular-connection+eval-fails
+(#?(:clj deftest :clje comment) regular-connection+eval-fails
   (let [[server-keys _] (gen-key-pair)
         exception (promise)]
     (with-open [server (server/start-server :tls? true
@@ -269,7 +272,7 @@
         (is (thrown? Exception (eval-value1 client '(+ 1 1))))
         (is (tls-socket-exception? exception))))))
 
-(deftest server-keys-then-good
+(#?(:clj deftest :clje comment) server-keys-then-good
   (let [[server-keys good-client-keys] (gen-key-pair)
         exception (promise)]
     (with-open [server (server/start-server :tls? true
@@ -298,7 +301,7 @@
         (let [client (nrepl/client transport 30000)]
           (is (= 2 (eval-value1 client '(+ 1 1)))))))))
 
-(deftest tls-client-proxy-test
+(#?(:clj deftest :clje comment) tls-client-proxy-test
   (let [[server-keys client-keys] (gen-key-pair)]
     (with-redefs [tls-client-proxy/atomic-println (fn [& _] nil)]
       (with-open [server (server/start-server :tls? true :tls-keys-str server-keys)]

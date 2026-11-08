@@ -1,0 +1,118 @@
+= nREPL on the BEAM
+:description: How to build, run and use the clojerl build of nREPL on the Erlang VM, and how it differs from the JVM build.
+
+This fork of nREPL also builds for https://github.com/clojerl/clojerl[clojerl], which runs Clojure on the Erlang VM (the BEAM).
+The shared sources are `.cljc` files.
+The JVM code is in `#?(:clj ...)` branches, and the BEAM code is in `#?(:clje ...)` branches.
+Code that only the BEAM uses is in `src/clje`.
+
+== Requirements
+
+* Erlang/OTP 26, 27 or 28. CI runs on these releases.
+* rebar3. The build uses the `rebar3_clojerl` plugin.
+* clojerl. The `test`, `ci` and `escript` profiles get clojerl from Hex.
+
+The library user supplies clojerl.
+The main dependency list in `rebar.config` is empty.
+The Hex package name is `clje_nrepl`.
+
+== Build and test
+
+[source,shell]
+----
+$ make clje-compile   # compile the nREPL namespaces
+$ make clje-test      # run the BEAM test namespaces
+$ make clje-escript   # build _build/escript/bin/nrepl
+----
+
+To run some test namespaces only, set `CLJE_NS`:
+
+[source,shell]
+----
+$ CLJE_NS="nrepl.core-test nrepl.cmdline-test" make clje-test
+----
+
+`make clje-compile` deletes the `nrepl.*` beam files before it compiles.
+`rebar3_clojerl` does not recompile a namespace that extends a protocol when the protocol changes.
+
+== Start a server
+
+The escript runs `nrepl.cmdline`, as `clojure -M -m nrepl.cmdline` does on the JVM:
+
+[source,shell]
+----
+$ _build/escript/bin/nrepl --port 7888
+nREPL server started on port 7888 on host 127.0.0.1 - nrepl://127.0.0.1:7888
+----
+
+The server writes the `.nrepl-port` file, as on the JVM.
+The server deletes the file when it stops.
+It also deletes the file on SIGTERM.
+
+To start a server from clojerl code, use `nrepl.server/start-server`:
+
+[source,clojure]
+----
+(require '[nrepl.server :as server])
+(def s (server/start-server :port 7888))
+----
+
+The server supports the bencode, EDN and tty transports, and filesystem sockets (`--socket PATH`).
+
+== Use the command-line client
+
+[source,shell]
+----
+$ _build/escript/bin/nrepl --connect --port 7888
+----
+
+The BEAM cannot trap SIGINT.
+So the client interrupts an evaluation on SIGQUIT, which is Control+\.
+Control+C stops the VM.
+
+== Differences from the JVM build
+
+=== Not supported
+
+* TLS. The `tls` and `tls_client_proxy` namespaces are not in the BEAM build.
+  A TLS request throws the error "TLS is not supported on the BEAM."
+  A `nrepls://` URL in the client exits with that error.
+* JVMTI and classloaders. The `util/jvmti` and `util/classloader` namespaces are not in the BEAM build.
+* Java class, member and keyword completion.
+
+=== Changed behavior
+
+* *Interrupt.* An interrupt kills the process that runs the evaluation.
+  The session then starts a new process.
+* *The `describe` op.* The `:versions` map has an `:erlang` key with the OTP release and the ERTS version.
+  It has no `:java` key.
+  The `:clojure` key gives the clojerl version.
+* *Error names.* `:ex` names the type of a clojerl error, for example `class clojerl.BadArgumentError`.
+  For a raw Erlang error, it names the kind and the reason, for example `class error:badarith`.
+* *Output.* Writes to `+*out*+` and `+*err*+` go to the message that started them, also from futures.
+  Raw `io:format` output goes to the latest message of the session.
+  Logger output does not reach the client.
+* *Strings.* A string is a binary.
+  Invalid UTF-8 passes through without a change.
+* *Completion.* Completion also gives Erlang modules and their exported functions, for example `lists/map`.
+* *Default namespace.* A new session starts in `user`.
+
+=== Middleware
+
+On the BEAM, `set-descriptor!` keeps the descriptor in a registry.
+clojerl cannot change the metadata of a var.
+Third-party middleware that reads `:nrepl.middleware/descriptor` from var metadata does not see the descriptors.
+Use `set-descriptor!` and the functions of `nrepl.middleware`.
+
+=== Known clojerl limits
+
+These limits come from clojerl and also affect code that you evaluate:
+
+* Lazy seqs do not cache their values. A lazy seq over a side effect repeats the side effect on each traversal.
+* `for` with a filtering `:when` loses matches after the first chunk of 32 items.
+* A top-level `def` must have a literal value, such as a number, a string or a collection of literals.
+  So `(def s (server/start-server))` fails. Keep such values in an atom that a function fills.
+* clojerl has no `with-redefs` and no refs.
+
+The port works around these limits in its own code.
+When clojerl fixes a limit, the port can delete its workaround.
