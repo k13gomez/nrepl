@@ -13,31 +13,63 @@
 
 ;; clojerl lazy seqs do not cache their values. Each traversal calls the
 ;; seq fn again, so a lazy seq over `recv` would lose messages. On the BEAM,
-;; the received messages go into a cache, and the seq cells read it by index.
+;; a fetcher process receives the messages and keeps them, and the seq
+;; cells ask it for message i. The fetcher also serializes the receives,
+;; as the lock of a JVM LazySeq does, so two readers never race for one
+;; message.
 
 #?(:clje
-   (defn- cached-recv
-     "Return message `i` from `cache`, an atom of `{:msgs [...] :end nil}`.
-  Receive it from `transport` if it is the next one. Return nil at the end
-  of the seq, which a recv timeout marks in `:end`."
-     [transport timeout cache i]
-     (let [{:keys [msgs end]} @cache]
-       (cond
-         (< i (count msgs)) (nth msgs i)
-         (= i end) nil
-         :else (if-some [resp (transport/recv transport timeout)]
-                 (do (swap! cache update :msgs conj resp)
-                     resp)
-                 (do (swap! cache assoc :end i)
-                     nil))))))
+   (defn- fetcher-loop
+     "Serve messages of `transport` by index. `msgs` holds the received ones.
+  `end` is the index where a recv timed out, so the seqs end there.
+  `waiters` wait for message (count msgs), which a helper process receives,
+  so the fetcher can still answer a new head while a recv waits."
+     [transport msgs end waiters]
+     (let [reply (fn [[from ref] v] (erlang/send from #erl[ref v]))
+           self (erlang/self)]
+       (receive*
+        #erl[:get from ref i timeout]
+        (cond
+          (< i (count msgs)) (do (reply [from ref] (nth msgs i))
+                                 (recur transport msgs end waiters))
+          (= i end) (do (reply [from ref] nil)
+                        (recur transport msgs end waiters))
+          :else (do (when (empty? waiters)
+                      (erlang/spawn (fn [] (erlang/send self #erl[:received (transport/recv transport timeout)]))))
+                    (recur transport msgs end (conj waiters [from ref]))))
+
+        #erl[:received resp]
+        (do (run! #(reply % resp) waiters)
+            (if (some? resp)
+              (recur transport (conj msgs resp) end [])
+              (recur transport msgs (count msgs) [])))
+
+        #erl[:head from ref]
+        ;; A new head starts at the first message no seq has taken. After a
+        ;; timeout ended the seqs, it receives again.
+        (let [i (count msgs)]
+          (reply [from ref] i)
+          (recur transport msgs (when-not (= i end) end) waiters))))))
+
+#?(:clje
+   (defn- start-fetcher [transport]
+     (erlang/spawn (fn [] (fetcher-loop transport [] nil [])))))
+
+#?(:clje
+   (defn- fetcher-call [fetcher request]
+     (let [ref (erlang/monitor :process fetcher)]
+       (erlang/send fetcher (request (erlang/self) ref))
+       (receive*
+        #erl[ref value] (do (erlang/demonitor ref #erl(:flush)) value)
+        #erl[:DOWN ref _ _ _] nil))))
 
 #?(:clje
    (defn- cached-recv-seq
-     "Return a lazy seq of the messages in `cache` from index `i` on."
-     [transport timeout cache i]
+     "Return a lazy seq of the messages of `fetcher` from index `i` on."
+     [fetcher timeout i]
      (lazy-seq
-      (when-some [resp (cached-recv transport timeout cache i)]
-        (cons resp (cached-recv-seq transport timeout cache (inc i)))))))
+      (when-some [resp (fetcher-call fetcher (fn [from ref] #erl[:get from ref i timeout]))]
+        (cons resp (cached-recv-seq fetcher timeout (inc i)))))))
 
 (defn response-seq
   "Returns a lazy seq of messages received via the given Transport.
@@ -48,7 +80,7 @@
   ([transport] (response-seq transport #?(:clj Long/MAX_VALUE :clje :infinity)))
   ([transport timeout]
    #?(:clj (take-while identity (repeatedly #(transport/recv transport timeout)))
-      :clje (cached-recv-seq transport timeout (atom {:msgs [] :end nil}) 0))))
+      :clje (cached-recv-seq (start-fetcher transport) timeout 0))))
 
 (#?(:clj defn :clje comment) client
   "Returns a fn of zero and one argument, both of which return the current head of a single
@@ -85,17 +117,12 @@
    Most REPL interactions are best performed via `message` and `client-session` on top of
    a client fn returned from this fn."
      [transport response-timeout]
-     (let [cache (atom {:msgs [] :end nil})]
+     (let [fetcher (start-fetcher transport)]
        ;; clojerl functions cannot carry metadata.
        (fn-with-meta
         (fn this
-          ;; The head is the first message that no seq has taken yet. After a
-          ;; timeout ended the seqs, a new call receives again.
-          ([] (let [{:keys [msgs end]} @cache
-                    i (count msgs)]
-                (when (= i end)
-                  (swap! cache assoc :end nil))
-                (cached-recv-seq transport response-timeout cache i)))
+          ([] (cached-recv-seq fetcher response-timeout
+                               (fetcher-call fetcher (fn [from ref] #erl[:head from ref]))))
           ([msg]
            (transport/send transport msg)
            (this)))

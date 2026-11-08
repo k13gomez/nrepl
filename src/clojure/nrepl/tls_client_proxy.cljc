@@ -10,35 +10,37 @@
   {:added "1.1"}
   (:require [nrepl.cmdline :as cmdline]
             [nrepl.socket :as socket]
-            [nrepl.tls :as tls])
-  (:import (java.net Socket ServerSocket)
-           (java.io IOException BufferedInputStream BufferedOutputStream Closeable InputStream OutputStream)
-           (java.time.format DateTimeFormatter)
-           (java.time ZonedDateTime)))
+            [nrepl.tls :as tls]
+            #?(:clje [nrepl.beam.socket :as beam-socket]))
+  #?(:clj
+     (:import (java.net Socket ServerSocket)
+              (java.io IOException BufferedInputStream BufferedOutputStream Closeable InputStream OutputStream)
+              (java.time.format DateTimeFormatter)
+              (java.time ZonedDateTime))))
 
-(def ^:private ^DateTimeFormatter pattern (DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss z"))
+(#?(:clj def :clje comment) ^:private ^DateTimeFormatter pattern (DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss z"))
 
-(defonce ^:private lock (Object.))
+(#?(:clj defonce :clje comment) ^:private lock (Object.))
 
-(defn- atomic-println [& args]
+(#?(:clj defn- :clje comment) atomic-println [& args]
   (locking lock
     (apply println args)))
 
-(defn- info [& args]
+(#?(:clj defn- :clje comment) info [& args]
   (apply atomic-println
          (into [(.format pattern (ZonedDateTime/now))
                 (str "[" (.getName (Thread/currentThread)) "]")
                 "INFO"]
                args)))
 
-(defn- warn [& args]
+(#?(:clj defn- :clje comment) warn [& args]
   (apply atomic-println
          (into [(.format pattern (ZonedDateTime/now))
                 (str "[" (.getName (Thread/currentThread)) "]")
                 "WARN"]
                args)))
 
-(defn- error [& args]
+(#?(:clj defn- :clje comment) error [& args]
   (binding [*out* *err*]
     (apply atomic-println
            (into [(.format pattern (ZonedDateTime/now))
@@ -46,7 +48,7 @@
                   "ERROR"]
                  args))))
 
-(defn- add-uncaught-exception-handler! []
+(#?(:clj defn- :clje comment) add-uncaught-exception-handler! []
   (Thread/setDefaultUncaughtExceptionHandler
    (reify Thread$UncaughtExceptionHandler
      (uncaughtException [_ thread ex]
@@ -56,7 +58,7 @@
        (error "Uncaught exception on" (.getName ^Thread thread))
        nil))))
 
-(defn- close [s]
+(#?(:clj defn- :clje comment) close [s]
   (when s
     (try
       (.close ^Closeable s)
@@ -67,7 +69,7 @@
   (when state
     (:running? @state)))
 
-(defn- accept [state ^ServerSocket server]
+(#?(:clj defn- :clje comment) accept [state ^ServerSocket server]
   (try
     (.accept server)
     (catch Exception e
@@ -75,7 +77,7 @@
         (error "Error during .accept:" (.getMessage e)))
       nil)))
 
-(defmacro socket-thread [state sock other-sock f]
+(#?(:clj defmacro :clje comment) socket-thread [state sock other-sock f]
   `(let [state# ~state]
      (future
        (try
@@ -96,7 +98,7 @@
          (finally
            (swap! state# update :threads (fnil disj #{}) (Thread/currentThread)))))))
 
-(defn- read-socket [state ^InputStream inp]
+(#?(:clj defn- :clje comment) read-socket [state ^InputStream inp]
   (try
     (let [v (.read inp)]
       (when (not= v -1)
@@ -106,7 +108,7 @@
         (warn "Exception while reading from socket:" (.getMessage e)))
       nil)))
 
-(defn- write-socket [state ^OutputStream out rd flush?]
+(#?(:clj defn- :clje comment) write-socket [state ^OutputStream out rd flush?]
   (try
     (.write out ^int rd)
     (when flush?
@@ -117,7 +119,7 @@
         (warn "Exception while writing to socket:" (.getMessage e)))
       nil)))
 
-(defn- available? [state ^InputStream inp]
+(#?(:clj defn- :clje comment) available? [state ^InputStream inp]
   (try
     (let [v (.available inp)]
       (> v 0))
@@ -126,7 +128,7 @@
         (warn "Exception while calling .available:" (.getMessage e)))
       nil)))
 
-(defn- pump! [state ^Socket src ^Socket dst]
+(#?(:clj defn- :clje comment) pump! [state ^Socket src ^Socket dst]
   (try
     (with-open [inp (BufferedInputStream. (.getInputStream src))
                 out (BufferedOutputStream. (.getOutputStream dst))]
@@ -140,7 +142,7 @@
         (throw e)
         nil))))
 
-(defn stop!
+(#?(:clj defn :clje comment) stop!
   "Stops all threads and closes all sockets associated with this TLS proxy. Waits for threads to exit."
   [state]
   (swap! state assoc :running? false)
@@ -149,8 +151,8 @@
       (close sock))
     (Thread/sleep 100)))
 
-(defn- proxy-connection [{:keys [tls-context remote-host remote-port connect-timeout-ms]}
-                         state sock]
+(#?(:clj defn- :clje comment) proxy-connection [{:keys [tls-context remote-host remote-port connect-timeout-ms]}
+                                                state sock]
   (when-let [tls-sock (try
                         (tls/socket tls-context remote-host remote-port connect-timeout-ms)
                         (catch Exception e
@@ -167,12 +169,12 @@
        (socket-thread state tls-sock sock (fn [_] (pump! state tls-sock sock)))
        (pump! state sock tls-sock)))))
 
-(defn- run-server [cfg state server-socket]
+(#?(:clj defn- :clje comment) run-server [cfg state server-socket]
   (while (running? state)
     (when-let [sock (accept state server-socket)]
       (proxy-connection cfg state sock))))
 
-(defn- err-exit [block? msg]
+(#?(:clj defn- :clje comment) err-exit [block? msg]
   (error msg)
   (if (true? block?)
     (do
@@ -180,7 +182,7 @@
       (System/exit 1))
     (throw (ex-info msg {}))))
 
-(defn start-tls-proxy
+(#?(:clj defn :clje comment) start-tls-proxy
   "Start a local TLS proxy. This will forward a local regular TCP connection to a remote TLS TCP connection.
 
   Required options:
@@ -248,6 +250,176 @@
       (info "TLS proxy exiting")
       (shutdown-agents))
     state))
+
+;; The BEAM versions. A process takes the place of each socket thread, and
+;; the pump moves whole chunks instead of single bytes.
+
+#?(:clje
+   (defn- log-line [level args]
+     (apply println (into [(erlang/list_to_binary
+                            (calendar/system_time_to_rfc3339 (erlang/system_time :second)))
+                           (str "[" (pr-str (erlang/self)) "]")
+                           level]
+                          args))))
+
+#?(:clje (defn- info [& args] (log-line "INFO" args)))
+
+#?(:clje (defn- warn [& args] (log-line "WARN" args)))
+
+#?(:clje (defn- error [& args] (binding [*out* *err*] (log-line "ERROR" args))))
+
+#?(:clje
+   (defn- close [s]
+     (when s
+       (try
+         (.close s)
+         (catch _ _
+           nil)))))
+
+#?(:clje
+   (defn- running? [state]
+     (when state
+       (:running? @state))))
+
+#?(:clje
+   (defn- accept [state server]
+     (try
+       (socket/accept server)
+       (catch _ e
+         (when (running? state)
+           (error "Error during accept:" (or (ex-message e) (pr-str e))))
+         nil))))
+
+#?(:clje
+   (defn- socket-process
+     "Run `(f sock)` in a new process, and close both sockets when it ends."
+     [state sock other-sock f]
+     (erlang/spawn
+      (fn []
+        (try
+          (swap! state update :threads (fnil conj #{}) (erlang/self))
+          (try
+            (swap! state update :sockets (fnil conj #{}) sock)
+            (f sock)
+            (finally
+              (close sock)
+              (close other-sock)
+              (swap! state update :sockets (fnil disj #{}) sock)))
+          (catch _ t
+            (error "Unhandled exception:" (or (ex-message t) (pr-str t)))
+            (swap! state update :unhandled-exceptions (fnil conj #{}) t))
+          (finally
+            (swap! state update :threads (fnil disj #{}) (erlang/self))))))))
+
+#?(:clje
+   (defn- pump! [state src dst]
+     (loop []
+       (when (running? state)
+         (when-let [data (try
+                           (beam-socket/read-available src)
+                           (catch _ e
+                             (when (running? state)
+                               (warn "Exception while reading from socket:" (or (ex-message e) (pr-str e))))
+                             nil))]
+           (when (try
+                   (socket/write dst data)
+                   true
+                   (catch _ e
+                     (when (running? state)
+                       (warn "Exception while writing to socket:" (or (ex-message e) (pr-str e))))
+                     nil))
+             (recur)))))))
+
+#?(:clje
+   (defn stop!
+     "Stops all processes and closes all sockets associated with this TLS proxy. Waits for the processes to exit."
+     [state]
+     (swap! state assoc :running? false)
+     (while (not-empty (:threads @state))
+       (doseq [sock (:sockets @state)]
+         (close sock))
+       (timer/sleep 100))))
+
+#?(:clje
+   (defn- proxy-connection [{:keys [tls-context remote-host remote-port connect-timeout-ms]}
+                            state sock]
+     (when-let [tls-sock (try
+                           (tls/socket tls-context remote-host remote-port connect-timeout-ms)
+                           (catch _ e
+                             (error "Could not connect to remote"
+                                    (str remote-host ":" remote-port)
+                                    ". Error message: " (or (ex-message e) (pr-str e)))
+                             (close sock)
+                             nil))]
+       (socket-process
+        state sock tls-sock
+        (fn [_]
+          (socket-process state tls-sock sock (fn [_] (pump! state tls-sock sock)))
+          (pump! state sock tls-sock))))))
+
+#?(:clje
+   (defn- run-server [cfg state server-socket]
+     (while (running? state)
+       (when-let [sock (accept state server-socket)]
+         (proxy-connection cfg state sock)))))
+
+#?(:clje
+   (defn- err-exit [block? msg]
+     (error msg)
+     (if (true? block?)
+       (erlang/halt 1)
+       (throw (ex-info msg {})))))
+
+#?(:clje
+   (defn start-tls-proxy
+     "Start a local TLS proxy. This will forward a local regular TCP connection to a remote TLS TCP connection.
+  See the JVM version for the options. On the BEAM, Control+\\ stops a
+  blocking proxy, because the BEAM cannot trap SIGINT."
+     [{:keys [remote-host remote-port tls-keys-str tls-keys-file bind port port-file block? state connect-timeout-ms]
+       :or   {bind               "127.0.0.1"
+              port               0
+              port-file          ".nrepl-tls-proxy-port"
+              connect-timeout-ms 10000
+              block?             true
+              state              (atom {})}}]
+     (stop! state)
+     (swap! state assoc :running? true)
+     (when (empty? remote-host) (err-exit block? ":remote-host not specified"))
+     (when (nil? remote-port) (err-exit block? ":remote-port not specified"))
+     (let [port-promise (promise)
+           block (promise)
+           cfg {:remote-host        remote-host
+                :remote-port        remote-port
+                :connect-timeout-ms connect-timeout-ms
+                :tls-context        (try
+                                      (tls/ssl-context-or-throw tls-keys-str tls-keys-file)
+                                      (catch _ e
+                                        (err-exit block? (str "Could not create TLS context: " (ex-message e)))))}
+           server (try
+                    (socket/inet-socket bind port)
+                    (catch _ e
+                      (err-exit block? (str "Could not bind to: " bind ":" port ". Error message: " (or (ex-message e) (pr-str e))))))]
+       (swap! state assoc :port-promise port-promise)
+       (socket-process
+        state server nil
+        (fn [sock]
+          (let [local-port (beam-socket/local-port sock)]
+            (deliver port-promise local-port)
+            (when port-file
+              (spit port-file (str local-port)))
+            (info "Started TLS proxy at"
+                  (str bind ":" local-port ".")
+                  "Proxying to" (str remote-host ":" remote-port "."))
+            (run-server cfg state sock))))
+       (when block?
+         (cmdline/set-signal-handler!
+          "INT"
+          (fn [_signal]
+            (stop! state)
+            (deliver block :done)))
+         @block
+         (info "TLS proxy exiting"))
+       state)))
 
 (comment
   (do

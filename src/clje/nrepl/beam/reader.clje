@@ -1,0 +1,121 @@
+(ns nrepl.beam.reader
+  "Finds where the next form of a character stream ends, without reading
+  it. The BEAM command-line client uses it in place of `read+string`.
+
+  The client sends each form to the server as text, so it only needs the
+  form boundary. The clojerl reader would also run `#=` forms on the
+  client, and it rejects tags and aliases that only the server knows.")
+
+(def ^:private whitespace #{" " "\t" "\n" "\r" ","})
+
+(def ^:private terminators #{"(" ")" "[" "]" "{" "}" "\"" ";"})
+
+(def ^:private closing {"(" ")" "[" "]" "{" "}"})
+
+(defn- next-char [rdr]
+  (let [c (erlang.io.IReader/read rdr)]
+    (when-not (= :eof c) c)))
+
+(defn- unread [rdr c]
+  (erlang.io.IPushbackReader/unread rdr c))
+
+(defn- read-token
+  "Add the characters of a token to `acc`, up to whitespace or a delimiter."
+  [rdr acc]
+  (loop [acc acc]
+    (let [c (next-char rdr)]
+      (cond
+        (nil? c) acc
+        (or (whitespace c) (terminators c)) (do (unread rdr c) acc)
+        :else (recur (conj acc c))))))
+
+(defn- read-string-literal
+  "Add a string body and its closing quote to `acc`. The opening quote is
+  already in `acc`."
+  [rdr acc]
+  (loop [acc acc]
+    (let [c (next-char rdr)]
+      (cond
+        (nil? c) acc
+        (= "\\" c) (let [c2 (next-char rdr)]
+                     (recur (cond-> (conj acc c) c2 (conj c2))))
+        (= "\"" c) (conj acc c)
+        :else (recur (conj acc c))))))
+
+(defn- skip-blank
+  "Skip whitespace and comments before a form. With `acc`, keep them in it.
+  Return [acc c], where `c` is the first character of the form, or nil at
+  the end of the input."
+  [rdr acc]
+  (loop [acc acc]
+    (let [c (next-char rdr)]
+      (cond
+        (nil? c) [acc nil]
+        (whitespace c) (recur (cond-> acc acc (conj c)))
+        (= ";" c) (recur (loop [acc (cond-> acc acc (conj c))]
+                           (let [c (next-char rdr)]
+                             (cond
+                               (nil? c) acc
+                               (= "\n" c) (cond-> acc acc (conj c))
+                               :else (recur (cond-> acc acc (conj c)))))))
+        :else [acc c]))))
+
+(declare read-form)
+
+(defn- read-delimited
+  "Add forms to `acc` up to the delimiter `close`, and add `close`."
+  [rdr acc close]
+  (loop [acc acc]
+    (let [[acc c] (skip-blank rdr acc)]
+      (cond
+        (nil? c) acc
+        (= close c) (conj acc c)
+        :else (recur (read-form rdr acc c))))))
+
+(defn- read-next-form
+  "Skip blanks into `acc`, then add the next form."
+  [rdr acc]
+  (let [[acc c] (skip-blank rdr acc)]
+    (if c (read-form rdr acc c) acc)))
+
+(defn- read-form
+  "Add the form that starts with character `c` to `acc`."
+  [rdr acc c]
+  (let [acc (conj acc c)]
+    (cond
+      (closing c) (read-delimited rdr acc (closing c))
+      (= "\"" c) (read-string-literal rdr acc)
+      (= "\\" c) (read-token rdr (if-let [c2 (next-char rdr)] (conj acc c2) acc))
+      (#{"'" "`" "@"} c) (read-next-form rdr acc)
+      (= "~" c) (let [c2 (next-char rdr)]
+                  (cond
+                    (= "@" c2) (read-next-form rdr (conj acc c2))
+                    (nil? c2) acc
+                    :else (do (unread rdr c2) (read-next-form rdr acc))))
+      ;; Metadata, then the form it applies to.
+      (= "^" c) (read-next-form rdr (read-next-form rdr acc))
+      (= "#" c) (let [c2 (next-char rdr)]
+                  (cond
+                    (nil? c2) acc
+                    (closing c2) (read-delimited rdr (conj acc c2) (closing c2))
+                    (= "\"" c2) (read-string-literal rdr (conj acc c2))
+                    ;; A discarded form, then the form that counts.
+                    (= "_" c2) (read-next-form rdr (read-next-form rdr (conj acc c2)))
+                    (#{"'" "="} c2) (read-next-form rdr (conj acc c2))
+                    (= "?" c2) (let [c3 (next-char rdr)]
+                                 (if (= "@" c3)
+                                   (read-next-form rdr (conj acc c2 c3))
+                                   (do (some->> c3 (unread rdr))
+                                       (read-next-form rdr (conj acc c2)))))
+                    (= "#" c2) (read-token rdr (conj acc c2))
+                    ;; A tag such as #inst, #erl or #:ns, then its form.
+                    :else (read-next-form rdr (read-token rdr (conj acc c2)))))
+      :else (read-token rdr acc))))
+
+(defn read-form-text
+  "Read the next form of the reader `rdr` and return its text, without
+  the blanks before it. Return nil at the end of the input."
+  [rdr]
+  (let [[_ c] (skip-blank rdr nil)]
+    (when c
+      (apply str (read-form rdr [] c)))))

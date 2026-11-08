@@ -3,9 +3,10 @@
   e.g. REPL-y for a proper command-line nREPL client @
   https://github.com/trptcolin/reply/"
   {:author "Chas Emerick"}
+  #?(:clje (:refer-clojure :exclude [format]))
   (:require
    [clojure.edn :as edn]
-   [clojure.java.io :as io]
+   #?(:clj [clojure.java.io :as io])
    [clojure.string :as str]
    [nrepl.config :as config]
    [nrepl.core :as nrepl]
@@ -14,25 +15,44 @@
    [nrepl.socket :as socket]
    [nrepl.transport :as transport]
    [nrepl.util.threading :as threading]
-   [nrepl.version :as version])
-  (:import
-   [clojure.lang LineNumberingPushbackReader]
-   [java.io FileNotFoundException IOException]))
+   [nrepl.version :as version]
+   #?@(:clje [[nrepl.beam.compat :refer [format requiring-resolve]]
+              [nrepl.beam.reader :as beam-reader]
+              [nrepl.beam.socket :as beam-socket]]))
+  #?(:clj
+     (:import
+      [clojure.lang LineNumberingPushbackReader]
+      [java.io FileNotFoundException IOException])))
+
+#?(:clje
+   (def ^:private port-file
+     "The `.nrepl-port` file that this process wrote, if any. The BEAM has no
+  `deleteOnExit`, so the exit paths delete it."
+     (atom nil)))
+
+#?(:clje
+   (defn- delete-port-file
+     "Delete the files that the JVM deletes on exit: the port file and the
+  files of unix server sockets."
+     []
+     (some-> @port-file file/delete)
+     (beam-socket/delete-unix-socket-files!)))
 
 (defn- clean-up-and-exit
   "Performs any necessary clean up and calls `(System/exit status)`."
   [status]
-  (shutdown-agents)
+  #?(:clj (shutdown-agents) :clje (delete-port-file))
   (flush)
   (binding [*out* *err*] (flush))
-  (System/exit status))
+  #?(:clj (System/exit status) :clje (erlang/halt status)))
 
 (defn exit
   "Requests that the process exit with the given `status`.  Does not
   return."
   [status]
   ;; :nrepl/kind is our shared (ns independent) ExceptionInfo discriminator
-  (throw (ex-info nil {:nrepl/kind ::exit ::status status})))
+  ;; clojerl ex-info needs a message.
+  (throw (ex-info #?(:clj nil :clje "") {:nrepl/kind ::exit ::status status})))
 
 (defn die
   "`Print`s items in `msg` to *err* and then exits with a status of 2."
@@ -41,7 +61,7 @@
     (doseq [m msg] (print m)))
   (exit 2))
 
-(defmacro ^{:author "Colin Jones"} set-signal-handler!
+(#?(:clj defmacro :clje comment) ^{:author "Colin Jones"} set-signal-handler!
   [signal f]
   (if (try (Class/forName "sun.misc.Signal")
            (catch Throwable _e))
@@ -53,7 +73,22 @@
        (catch Throwable e#))
     `(println "Unable to set signal handlers.")))
 
-(def colored-output
+#?(:clje
+   (defmacro set-signal-handler!
+     "The BEAM cannot trap SIGINT, so the handler for \"INT\" runs on SIGQUIT
+  (Control+\\). A SIGTERM deletes the port file before the VM stops."
+     [_signal f]
+     `(nrepl_signal_handler/install
+       (fn [signal#]
+         (case signal#
+           :sigquit (~f signal#)
+           :sigterm (#'nrepl.cmdline/delete-port-file)
+           nil)))))
+
+;; clojerl accepts only literal values in a top-level def, so on clje this
+;; is a function that returns the map.
+(#?(:clj def :clje defn) colored-output
+  #?@(:clje [[]])
   {:err #(binding [*out* *err*]
            (print "\033[31m")
            (print %)
@@ -72,23 +107,31 @@
 (defn- done?
   [input]
   (some (partial = input)
-        ['exit 'quit '(exit) '(quit)]))
+        ;; On the BEAM the input is text, see read-form-for-server.
+        #?(:clj ['exit 'quit '(exit) '(quit)]
+           :clje ["exit" "quit" "(exit)" "(quit)"])))
 
 (defn repl-intro
   "Returns nREPL interactive repl intro copy and version info as a new-line
   separated string."
   []
-  (format "nREPL %s
+  (format #?(:clj "nREPL %s
 Clojure %s
 %s %s
 Interrupt: Control+C
 Exit:      Control+D or (exit) or (quit)"
+             :clje "nREPL %s
+Clojerl %s
+%s %s
+Interrupt: Control+\\
+Exit:      Control+D or (exit) or (quit)")
           (:version-string version/version)
           (clojure-version)
-          (System/getProperty "java.vm.name")
-          (System/getProperty "java.runtime.version")))
+          #?(:clj (System/getProperty "java.vm.name") :clje "Erlang/OTP")
+          #?(:clj (System/getProperty "java.runtime.version")
+             :clje (erlang/list_to_binary (erlang/system_info :otp_release)))))
 
-(def ^:private permissive-reader-resolver
+(#?(:clj def :clje comment) ^:private permissive-reader-resolver
   "A reader resolver that accepts any alias or class name. Used when reading
   user input purely to find form boundaries (see `read-form-for-server`):
   aliases and classes may exist only in the server's session, so the client
@@ -99,9 +142,9 @@ Exit:      Control+D or (exit) or (quit)"
     (resolveAlias [_ sym] sym)
     (resolveVar [_ sym] sym)))
 
-(def ^:private eof-marker (Object.))
+(#?(:clj def :clje comment) ^:private eof-marker (Object.))
 
-(defn- read-form-for-server
+(#?(:clj defn- :clje comment) read-form-for-server
   "Reads a single form from `rdr` and returns a map of `:form` and `:code` -
   the exact input text that was consumed - or `::eof` when the input is
   exhausted.
@@ -132,13 +175,24 @@ Exit:      Control+D or (exit) or (quit)"
         ::eof
         {:form form :code code}))))
 
+#?(:clje
+   (defn- read-form-for-server
+     "Reads the text of a single form from `rdr` and returns a map of `:form`
+  and `:code`, or `::eof` when the input is exhausted. The client finds only
+  the boundary of the form and never reads it, so `:form` is the trimmed
+  text, enough to detect the exit and quit commands."
+     [rdr]
+     (if-let [code (beam-reader/read-form-text rdr)]
+       {:form code :code code}
+       ::eof)))
+
 (defn- skip-to-end-of-line
   "Discards the rest of the current line. Used after a reader error, the way
   `clojure.main`'s REPL does."
-  [^LineNumberingPushbackReader rdr]
+  [^#?(:clj LineNumberingPushbackReader :clje erlang.io.IReader) rdr]
   (try
-    (.readLine rdr)
-    (catch IOException _ nil)))
+    #?(:clj (.readLine rdr) :clje (erlang.io.IReader/read_line rdr))
+    (catch #?(:clj IOException :clje _) _ nil)))
 
 (defn- run-repl-with-transport
   [transport {:keys [prompt err out value]
@@ -146,7 +200,7 @@ Exit:      Control+D or (exit) or (quit)"
                      err    print
                      out    print
                      value  println}}]
-  (let [client (nrepl/client transport Long/MAX_VALUE)
+  (let [client (nrepl/client transport #?(:clj Long/MAX_VALUE :clje :infinity))
         awaiting (atom {})]
     (println (repl-intro))
     (threading/run-with @threading/transport-executor
@@ -157,23 +211,24 @@ Exit:      Control+D or (exit) or (quit)"
         (when-let [p (and (some #{:done "done"} (:status res))
                           (get @awaiting (:id res)))]
           (deliver p true))
-        (when (some-> ^String (:id res)
-                      (.startsWith "nrepl.cmdline-"))
+        (when (some-> ^#?(:clj String :clje clojerl.String) (:id res)
+                      #?(:clj (.startsWith "nrepl.cmdline-") :clje (str/starts-with? "nrepl.cmdline-")))
           (some-> (:value res) value))
         (flush)))
     ;; We take 50ms to listen to any greeting messages, and display the value
     ;; in the `:out` slot.
-    (Thread/sleep 50)
+    #?(:clj (Thread/sleep 50) :clje (timer/sleep 50))
     (let [session (nrepl/client-session client)
-          input-reader (LineNumberingPushbackReader. *in*)]
+          input-reader #?(:clj (LineNumberingPushbackReader. *in*) :clje *in*)]
       (swap! running-repl assoc :transport transport :client session)
-      (binding [*ns* *ns*]
+      ;; clojerl starts in clje.user, so the BEAM starts the prompt in user.
+      (binding [*ns* #?(:clj *ns* :clje (create-ns 'user))]
         (loop []
           (prompt *ns*)
           (flush)
           (let [input (try
                         (read-form-for-server input-reader)
-                        (catch Exception e
+                        (catch #?(:clj Exception :clje _) e
                           ;; A broken form should never take the REPL down.
                           ;; Report it and discard the rest of the line, like
                           ;; clojure.main does; the reader is then guaranteed
@@ -226,13 +281,13 @@ Exit:      Control+D or (exit) or (quit)"
     (#{"http" "https"} scheme)
     (try
       (require 'drawbridge.client)
-      (catch FileNotFoundException e
+      (catch #?(:clj FileNotFoundException :clje _) e
         ;; drawbridge pulls in clj-http and cheshire, which fail the same way,
         ;; so don't blame drawbridge for one of its dependencies.
-        (if (str/includes? (str (.getMessage e)) "drawbridge")
+        (if (str/includes? (str #?(:clj (.getMessage e) :clje (ex-message e))) "drawbridge")
           (die (format "nREPL: connecting to %s URLs requires the nrepl/drawbridge library on the classpath.\n"
                        scheme))
-          (die (format "nREPL: couldn't load drawbridge.client: %s\n" (.getMessage e))))))))
+          (die (format "nREPL: couldn't load drawbridge.client: %s\n" #?(:clj (.getMessage e) :clje (ex-message e)))))))))
 
 (def ^:private unix-url-transports
   "Transports keyed by the scheme a filesystem-socket server advertises. Those
@@ -273,7 +328,7 @@ Exit:      Control+D or (exit) or (quit)"
         (map (fn [transport] [(str (transport/uri-scheme transport) "s") transport]))
         [#'transport/bencode #'transport/edn]))
 
-(defn- tls-url-connect
+(#?(:clj defn- :clje comment) tls-url-connect
   "Connects to a TLS URL (see `tls-url-transports`), as advertised in a
   TLS-enabled server's startup message. The TLS keys must be supplied
   separately via the `:tls-keys-file`/`:tls-keys-str` options."
@@ -297,6 +352,31 @@ Exit:      Control+D or (exit) or (quit)"
                    :transport-fn (tls-url-transports scheme)
                    :tls-keys-file tls-keys-file
                    :tls-keys-str tls-keys-str)))
+
+#?(:clje
+   (defn- tls-url-connect
+     "Connects to a TLS URL (see `tls-url-transports`), as advertised in a
+  TLS-enabled server's startup message. The TLS keys must be supplied
+  separately via the `:tls-keys-file`/`:tls-keys-str` options."
+     [url scheme {:keys [tls-keys-file tls-keys-str]}]
+     (when-not (or tls-keys-file tls-keys-str)
+       (die (format "nREPL: %s:// URLs require --tls-keys-file or --tls-keys-str.\n" scheme)))
+     (let [uri (uri_string/parse url)
+           _ (when (erlang/is_tuple uri)
+               (die (format "nREPL: Invalid URL %s.\n" url)))
+           host (get uri :host)
+           port (get uri :port 0)]
+       (when-not (seq host)
+         (die (format "nREPL: Can't extract a host from the URL %s.\n" url)))
+       (when (> port 65535)
+         (die (format "nREPL: Invalid port %d in URL %s.\n" port url)))
+       (nrepl/connect :host host
+                      ;; The same default port nrepl.core/url-connect uses for
+                      ;; the other nrepl schemes.
+                      :port (if (pos? port) port 7888)
+                      :transport-fn (tls-url-transports scheme)
+                      :tls-keys-file tls-keys-file
+                      :tls-keys-str tls-keys-str))))
 
 (defn- run-repl
   ([{:keys [server options]}]
@@ -323,10 +403,10 @@ Exit:      Control+D or (exit) or (quit)"
             (ensure-url-scheme-support! scheme)
             (try
               (nrepl/url-connect host)
-              (catch java.net.URISyntaxException e
-                (die (format "nREPL: Invalid URL %s (%s).\n" host (.getMessage e))))
-              (catch IllegalArgumentException e
-                (die (format "nREPL: %s\n" (.getMessage e))))))
+              #?@(:clj [(catch java.net.URISyntaxException e
+                          (die (format "nREPL: Invalid URL %s (%s).\n" host (.getMessage e))))])
+              (catch #?(:clj IllegalArgumentException :clje _) e
+                (die (format "nREPL: %s\n" #?(:clj (.getMessage e) :clje (ex-message e)))))))
 
         socket
         (nrepl/connect :socket socket :transport-fn transport)
@@ -428,7 +508,7 @@ Exit:      Control+D or (exit) or (quit)"
 
 (defn- resolve-mware-by-name [sym]
   (try (require-and-resolve :middleware sym)
-       (catch FileNotFoundException _
+       (catch #?(:clj FileNotFoundException :clje _) _
          (when-not (:optional (meta sym))
            (die (format "nREPL %s: unable to resolve %s\n" (name key) sym))))))
 
@@ -446,8 +526,8 @@ Exit:      Control+D or (exit) or (quit)"
     (if (and transport client)
       (doseq [res (nrepl/message client {:op "interrupt"})]
         (when (= ["done" "session-idle"] (:status res))
-          (System/exit 0)))
-      (System/exit 0))))
+          #?(:clj (System/exit 0) :clje (clean-up-and-exit 0))))
+      #?(:clj (System/exit 0) :clje (clean-up-and-exit 0)))))
 
 (defn- ->mw-list
   [middleware-var-strs]
@@ -468,7 +548,7 @@ Exit:      Control+D or (exit) or (quit)"
   (cond
     (nil? x) x
     (number? x) x
-    :else (Integer/parseInt x)))
+    :else #?(:clj (Integer/parseInt x) :clje (erlang/binary_to_integer x))))
 
 (defn- sanitize-middleware-option
   "Sanitize the middleware option.  In the config it can be either a
@@ -499,7 +579,7 @@ Exit:      Control+D or (exit) or (quit)"
   remaining args."
   [args]
   (let [[options _args] (split-args (expand-shorthands args))
-        merge-config (partial merge-with meta-merge config/config)
+        merge-config (partial merge-with meta-merge #?(:clj config/config :clje (config/config*)))
         options (-> options
                     (keywordize-options)
                     (parse-cli-values)
@@ -608,10 +688,10 @@ Exit:      Control+D or (exit) or (quit)"
       (die "The built-in client does not support the tty transport. Consider using `nc` or `telnet`.\n"))
     (if socket
       (repl-fn {:server  server
-                :options (merge (when (:color options) colored-output)
+                :options (merge (when (:color options) #?(:clj colored-output :clje (colored-output)))
                                 {:transport transport})})
       (repl-fn host port
-               (merge (when (:color options) colored-output)
+               (merge (when (:color options) #?(:clj colored-output :clje (colored-output)))
                       {:transport transport}
                       (select-keys options [:tls-keys-str :tls-keys-file]))))))
 
@@ -633,11 +713,11 @@ Exit:      Control+D or (exit) or (quit)"
   Returns connection header string."
   [{:keys [host port socket] :as server} options]
   (let [transport (:transport options)
-        ^java.net.URI uri (socket/as-nrepl-uri server (transport/uri-scheme transport))]
+        ^#?(:clj java.net.URI :clje erlang.Type) uri (socket/as-nrepl-uri server (transport/uri-scheme transport))]
     ;; The format here is important, as some tools (e.g. CIDER) parse the string
     ;; to extract from it the host and the port to connect to
     (if socket
-      (str "nREPL server started on socket " (.toASCIIString uri))
+      (str "nREPL server started on socket " #?(:clj (.toASCIIString uri) :clje uri))
       (format "nREPL server started on port %d on host %s - %s"
               port host uri))))
 
@@ -648,10 +728,15 @@ Exit:      Control+D or (exit) or (quit)"
   Returns nil."
   [server _options]
   ;; Many clients look for this file to infer the port to connect to
-  (let [port (:port server)
-        port-file (io/file ".nrepl-port")]
-    (.deleteOnExit ^java.io.File port-file)
-    (spit port-file port)))
+  #?(:clj
+     (let [port (:port server)
+           port-file (io/file ".nrepl-port")]
+       (.deleteOnExit ^java.io.File port-file)
+       (spit port-file port))
+     :clje
+     (let [port (:port server)]
+       (reset! port-file ".nrepl-port")
+       (spit ".nrepl-port" port))))
 
 (defn start-server
   "Creates an nREPL server instance.
@@ -684,7 +769,7 @@ Exit:      Control+D or (exit) or (quit)"
                   (interactive-repl server options)
                   ;; Lock the main thread to prevent process from quitting while
                   ;; the server is running.
-                  (.join (Thread/currentThread))))))
+                  #?(:clj (.join (Thread/currentThread)) :clje (timer/sleep :infinity))))))
 
 (defn -main
   [& args]
@@ -692,7 +777,7 @@ Exit:      Control+D or (exit) or (quit)"
     (set-signal-handler! "INT" handle-interrupt)
     (let [[options _args] (args->cli-options args)]
       (dispatch-commands options))
-    (catch clojure.lang.ExceptionInfo ex
+    (catch #?(:clj clojure.lang.ExceptionInfo :clje clojerl.ExceptionInfo) ex
       (let [{:keys [:nrepl/kind ::status]} (ex-data ex)]
         (case kind
           ::exit (clean-up-and-exit status)
@@ -700,6 +785,6 @@ Exit:      Control+D or (exit) or (quit)"
            :nrepl.server/invalid-start-request)
           (do
             (binding [*out* *err*]
-              (println (.getMessage ex)))
+              (println #?(:clj (.getMessage ex) :clje (ex-message ex))))
             (clean-up-and-exit 2))
           (throw ex))))))

@@ -1,0 +1,49 @@
+name: BEAM
+
+# Builds and tests nREPL on clojerl. The JVM build runs on CircleCI.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["26", "27", "28"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: "3.24"
+
+      # The shared sources are .cljc, so that both builds read them. A plain
+      # .clj file would be invisible to clojerl.
+      - name: Check that the shared sources are .cljc
+        run: |
+          if find src/clojure test/clojure -name '*.clj' | grep .; then
+            echo "Rename these files to .cljc."
+            exit 1
+          fi
+
+      - name: Run the BEAM tests
+        run: make clje-test
+
+      - name: Build the escript
+        run: rebar3 as escript clojerl escriptize
+
+      - name: Smoke test the escript server
+        run: |
+          _build/escript/bin/nrepl --port 7888 &
+          for i in $(seq 1 30); do
+            nc -z localhost 7888 && break
+            sleep 1
+          done
+          reply=$( (printf 'd4:code7:(+ 1 2)2:op4:evale'; sleep 2) | nc localhost 7888 )
+          echo "$reply"
+          echo "$reply" | grep -q '5:value1:3'
+          echo "$reply" | grep -q '6:statusl4:donee'

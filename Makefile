@@ -1,4 +1,4 @@
-.PHONY: test eastwood cljfmt kondo cloverage install deploy clean lint javac javac-test docs verify-docs verify-cljdoc check-env check-release-tag clje-compile clje-test
+.PHONY: test eastwood cljfmt kondo cloverage install deploy clean lint javac javac-test docs verify-docs verify-cljdoc check-env check-release-tag clje-compile clje-test clje-escript
 .DEFAULT_GOAL := install
 
 # Set bash instead of sh for the @if [[ conditions,
@@ -33,6 +33,11 @@ clje-compile:
 CLJE_TEST_NS ?= nrepl.bencode-test nrepl.middleware.session-test nrepl.util.out-test \
 	nrepl.middleware.interruptible-eval-test nrepl.middleware.load-file-test nrepl.middleware.print-test \
 	nrepl.middleware.completion-test nrepl.middleware.lookup-test nrepl.util.completion-test nrepl.util.lookup-test
+
+# Builds _build/escript/bin/nrepl, which runs nrepl.cmdline.
+clje-escript:
+	rm -f _build/escript/lib/nrepl/ebin/nrepl.*.beam
+	rebar3 as escript clojerl escriptize
 
 clje-test: clje-compile
 	for ns in $(if $(CLJE_NS),$(CLJE_NS),$(CLJE_TEST_NS)); do \

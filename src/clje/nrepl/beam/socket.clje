@@ -102,18 +102,44 @@
     nil)
 
   clojerl.IStringable
-  (str [_] (str "#<nrepl.beam.socket.Connection " (pr-str sock) ">")))
+  (str [_] (str "#<nrepl.beam.socket.Connection " (pr-str sock) ">"))
+
+  ;; A deftype has no default hash or equality, and callers keep sockets
+  ;; in sets.
+  clojerl.IHash
+  (hash [this] (erlang/phash2 this))
+
+  clojerl.IEquiv
+  (equiv [this other] (erlang/=:= this other)))
+
+(def ^:private unix-paths
+  "The filesystem paths of the open unix server sockets."
+  (atom #{}))
+
+(defn delete-unix-socket-files!
+  "Delete the files of all open unix server sockets. The BEAM has no
+  `deleteOnExit`, so the exit paths of the command line call this."
+  []
+  (run! #(file/delete %) @unix-paths))
 
 (deftype ServerSocket [mod lsock path owner ssl-opts]
   erlang.io.ICloseable
   (close [_]
     (close* mod lsock)
     (erlang/send owner :stop)
-    (when path (file/delete path))
+    (when path
+      (swap! unix-paths disj path)
+      (file/delete path))
     nil)
 
   clojerl.IStringable
-  (str [_] (str "#<nrepl.beam.socket.ServerSocket " (pr-str lsock) ">")))
+  (str [_] (str "#<nrepl.beam.socket.ServerSocket " (pr-str lsock) ">"))
+
+  clojerl.IHash
+  (hash [this] (erlang/phash2 this))
+
+  clojerl.IEquiv
+  (equiv [this other] (erlang/=:= this other)))
 
 (defn- in-owner
   "Run `open` in a new process that owns the socket it returns. The process
@@ -156,6 +182,7 @@
   [path]
   (let [opts (lists/append tcp-options #erl(#erl[:ifaddr #erl[:local path]]))
         [lsock owner] (in-owner #(gen_tcp/listen 0 opts))]
+    (swap! unix-paths conj path)
     (ServerSocket. :gen_tcp lsock path owner nil)))
 
 (defn tls-server-socket
@@ -241,6 +268,15 @@
                (unwrap (ssl/connect (parse-address host) port
                                     (lists/append tcp-options ssl-opts)
                                     timeout-ms))))
+
+(defn read-available
+  "Return the bytes that the connection `c` has now, waiting for at least
+  one. Return nil at the end of the input."
+  [^Connection c]
+  (let [sock (.-sock c)]
+    (when-let [buf (fill (.-mod c) sock)]
+      (erlang/put (buffer-key sock) "")
+      buf)))
 
 (defn connected?
   "Return true if the connection `c` is still open."

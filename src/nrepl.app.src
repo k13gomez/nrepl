@@ -2,7 +2,7 @@
 , [ {description, "nREPL server and client for clojerl"}
   , {vsn, "1.8.0-clje"}
   , {modules, []}
-  , {applications, [kernel, stdlib, clojerl]}
+  , {applications, [kernel, stdlib, crypto, public_key, ssl, clojerl]}
   , {licenses, ["EPL-1.0"]}
   , {pkg_name, clje_nrepl}
   , {links, [{"GitHub", "https://github.com/k13gomez/nrepl"}]}

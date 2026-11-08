@@ -122,42 +122,46 @@
     (reduce #(send-output stream %1 %2) (assoc st :buf buf) texts)))
 
 (defn- output-loop
-  "Serve the output of a session. `msgs` maps each message to its state.
-  `latest` is the [msg respond quota] of the message that raw I/O requests
-  write to."
+  "Serve the output of a session. `msgs` maps the key of each message to
+  its state. `latest` is the [msg respond quota] of the message that raw I/O
+  requests write to.
+
+  The key is an Erlang hash of the message. A message can hold values that
+  clojerl cannot hash, such as the reader in the :code of a tty eval."
   [stream buffer-size msgs latest]
-  (let [state-of (fn [msgs msg respond quota]
-                   (or (get msgs msg) (new-message-state msg respond quota)))]
+  (let [k #(erlang/phash2 %)
+        state-of (fn [msgs msg respond quota]
+                   (or (get msgs (k msg)) (new-message-state msg respond quota)))]
     (receive*
      #erl[:begin msg respond quota]
      (recur stream buffer-size msgs [msg respond quota])
 
      #erl[:write msg respond quota text]
      (let [st (write-message stream buffer-size (state-of msgs msg respond quota) text false)]
-       (recur stream buffer-size (assoc msgs msg st) latest))
+       (recur stream buffer-size (assoc msgs (k msg) st) latest))
 
      #erl[:flush from ref msg]
-     (let [msgs (if-let [st (get msgs msg)]
-                  (assoc msgs msg (write-message stream buffer-size st "" true))
+     (let [msgs (if-let [st (get msgs (k msg))]
+                  (assoc msgs (k msg) (write-message stream buffer-size st "" true))
                   msgs)]
        (erlang/send from #erl[ref :ok])
        (recur stream buffer-size msgs latest))
 
      #erl[:end from ref msg]
      ;; Later output for the message, from a future, starts a new state.
-     (do (when-let [st (get msgs msg)]
+     (do (when-let [st (get msgs (k msg))]
            (write-message stream buffer-size st "" true))
          (erlang/send from #erl[ref :ok])
-         (recur stream buffer-size (dissoc msgs msg) latest))
+         (recur stream buffer-size (dissoc msgs (k msg)) latest))
 
      #erl[:io_request from reply-as request]
      (let [text (put-chars-text request)
            msgs (if-let [[msg respond quota] (when text latest)]
                   ;; A raw I/O request is synchronous, so send its text now.
                   ;; It then goes out before any later response of the eval.
-                  (assoc msgs msg (write-message stream buffer-size
-                                                 (state-of msgs msg respond quota)
-                                                 text true))
+                  (assoc msgs (k msg) (write-message stream buffer-size
+                                                     (state-of msgs msg respond quota)
+                                                     text true))
                   msgs)]
        (erlang/send from #erl[:io_reply reply-as (if text :ok #erl[:error :enotsup])])
        (recur stream buffer-size msgs latest))

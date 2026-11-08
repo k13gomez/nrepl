@@ -333,9 +333,11 @@
    via simple in/out readers, as with a tty or telnet connection."
      ([s] (tty s s s))
      ([in out & [s]]
-      ;; The eval reads the code from `r` in the session process. A queue
+      ;; The eval reads the code from `r`, in a session process or in an
+      ;; ephemeral one. A clojerl PushbackReader is a process, so the read
+      ;; buffer lives there and every reader sees the same input. A queue
       ;; that holds one token takes the place of the JVM semaphore.
-      (let [r (bytes/char-reader (socket/buffered-input in))
+      (let [r (erlang.io.PushbackReader. (bytes/char-reader (socket/buffered-input in)))
             w (socket/buffered-output out)
             cns (atom "user")
             read-sync (doto (queue/start false) (queue/put :token))
