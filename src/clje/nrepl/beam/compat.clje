@@ -123,15 +123,29 @@
       (recur cause)
       e)))
 
+(defn- raw-error-name [kind reason]
+  (str (name kind) ":" (erlang/iolist_to_binary (io_lib/format "~p" #erl(reason)))))
+
+(defn as-error
+  "Return `e` if it is a clojerl error. Otherwise return an ex-info for the
+  raw Erlang term `e` of the class `kind`. clojerl cannot print an ex-info
+  whose cause is a raw term, so a cause must go through this first."
+  [kind e]
+  (if (throwable? e)
+    e
+    (ex-info (raw-error-name kind e) {::class kind ::reason e})))
+
 (defn error-name
   "Return the name of the error `e` of the Erlang class `kind` (`:error`,
   `:throw` or `:exit`). A clojerl error gives its type, for example
   `clojerl.ExceptionInfo`. A raw Erlang term gives the class and the term,
-  for example `error:badarith`."
+  for example `error:badarith`, also when `as-error` wrapped it."
   [kind e]
-  (if (throwable? e)
-    (str (type e))
-    (str (name kind) ":" (erlang/iolist_to_binary (io_lib/format "~p" #erl(e))))))
+  (let [{::keys [class reason]} (when (throwable? e) (ex-data e))]
+    (cond
+      class (raw-error-name class reason)
+      (throwable? e) (str (type e))
+      :else (raw-error-name kind e))))
 
 (def ^:private restored-namespaces
   "Names of the namespaces that `restore-ns-mappings!` already handled."

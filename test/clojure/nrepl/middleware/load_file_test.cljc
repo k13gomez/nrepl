@@ -4,8 +4,9 @@
    [clojure.test :refer :all]
    [nrepl.core :as nrepl]
    [nrepl.core-test :refer [def-repl-test repl-server-fixture project-base-dir]])
-  (:import
-   (java.io File)))
+  #?(:clj
+     (:import
+      (java.io File))))
 
 (use-fixtures :each repl-server-fixture)
 
@@ -15,7 +16,9 @@
   (is (contains?
        ;; different versions of Clojure use different default :file metadata
        #{[{:file "NO_SOURCE_PATH" :line 4}]
-         [{:file "NO_SOURCE_FILE" :line 4}]}
+         [{:file "NO_SOURCE_FILE" :line 4}]
+         ;; clojerl sets no :file without a source path.
+         #?@(:clje [[{:line 4}]])}
        (repl-values timeout-session
                     (nrepl/code
                      (-> #'function
@@ -36,7 +39,8 @@
   (dorun
    (nrepl/message timeout-session
                   {:op "load-file"
-                   :file (slurp (File. project-base-dir "load-file-test/nrepl/load_file_sample.clj"))
+                   :file (slurp #?(:clj (File. project-base-dir "load-file-test/nrepl/load_file_sample.clj")
+                                   :clje (str project-base-dir "/load-file-test/nrepl/load_file_sample.clj")))
                    :file-path "nrepl/load_file_sample.clj"
                    :file-name "load_file_sample.clj"}))
   (is (= [{:file "nrepl/load_file_sample.clj" :line 5}]

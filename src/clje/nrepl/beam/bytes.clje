@@ -115,6 +115,12 @@
   [b]
   (BinaryInput. (process-val! b)))
 
+(defn remaining
+  "Return the bytes that the binary input `input` has not returned yet,
+  including the bytes pushed back into it."
+  [^BinaryInput input]
+  @(.-buf input))
+
 (defn binary-output
   "Return a byte output that collects what it gets in memory.
   Call `output->binary` to get the bytes."

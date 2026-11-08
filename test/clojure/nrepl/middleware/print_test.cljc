@@ -6,15 +6,16 @@
 
    These tests are transport agnostic, and do not deal with sessions, session
    IDs, and message IDs"
-  (:refer-clojure :exclude [print])
-  (:require [clojure.java.io :as io]
+  (:refer-clojure :exclude [print #?@(:clje [format])])
+  (:require #?(:clj [clojure.java.io :as io])
             [clojure.test :refer [deftest is testing]]
             [matcher-combinators.matchers :as mc]
             [nrepl.core :refer [combine-responses]]
             [nrepl.middleware.print :as print]
             [nrepl.test-helpers :refer [is+]]
-            [nrepl.transport :as t])
-  (:import [java.io Writer]))
+            [nrepl.transport :as t]
+            #?(:clje [nrepl.beam.compat :refer [format]]))
+  #?(:clj (:import [java.io Writer])))
 
 (defn echo-handler
   [{:keys [transport] :as msg}]
@@ -46,7 +47,7 @@
        ~@body)))
 
 (defn custom-printer
-  [value ^Writer writer opts]
+  [value ^#?(:clj Writer :clje erlang.io.IWriter) writer opts]
   (.write writer (format "<foo %s %s>" value (or (:sub opts) "..."))))
 
 (deftest value-printing
@@ -175,7 +176,7 @@
                   ::print/quota   8}))))
 
 (defn custom-printer-2
-  [value ^Writer writer]
+  [value ^#?(:clj Writer :clje erlang.io.IWriter) writer]
   (.write writer (format "<bar %s>" value)))
 
 ;; These tests used to the `session-print-configuration` tests from `core-test`.
@@ -236,11 +237,13 @@
 
 (deftest unicode-printing-test
   (testing-print "unicode characters are handled correctly"
-    (let [big-naughty-string (slurp (io/resource "blns.txt"))]
+    (let [big-naughty-string (slurp #?(:clj (io/resource "blns.txt") :clje "test/blns.txt"))]
       (is+ [{:value (pr-str big-naughty-string)}
             (mc/equals {})]
            (handle {:value              big-naughty-string
                     ;; Enable streaming printer to force the usage
                     ;; of replying-PrintWriter.
                     ::print/stream?     1
-                    ::print/buffer-size 100000})))))
+                    ;; clojerl prints this string as a #bin byte list, which
+                    ;; is longer than 100000 bytes, so the BEAM needs more.
+                    ::print/buffer-size #?(:clj 100000 :clje 1000000)})))))

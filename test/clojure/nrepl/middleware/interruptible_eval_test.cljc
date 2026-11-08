@@ -8,7 +8,7 @@
 
 (use-fixtures :each repl-server-fixture)
 
-(defn- find-frame-ending-with [^Throwable ex, suffix]
+(#?(:clj defn- :clje comment) find-frame-ending-with [^Throwable ex, suffix]
   (some #(when (str/ends-with? (.getClassName ^StackTraceElement %) suffix) %)
         (.getStackTrace ex)))
 
@@ -19,5 +19,15 @@
                           {:op "eval" :code "(defn div0 [] (/ 1 0))"
                            :file "src/acme/foo.clj" :line 42}))
     (dorun (repl-eval session "(div0)"))
-    (let [[resp] (repl-values session "(.getFileName (find-frame-ending-with *e \"div0\"))")]
+    (let [[resp] (repl-values session #?(:clj "(.getFileName (find-frame-ending-with *e \"div0\"))"
+                                         :clje "(find-frame-file *stacktrace \"div0\")"))]
       (is (= "foo.clj" resp)))))
+
+;; On the BEAM the stack trace of *e is in *stacktrace. Each frame is
+;; [module function arity location], and the location has the file.
+#?(:clje
+   (defn- find-frame-file [stacktrace fn-name]
+     (some (fn [[_ f _ location]]
+             (when (str/includes? (str f) fn-name)
+               (some-> (proplists/get_value :file location) erlang/list_to_binary filename/basename)))
+           stacktrace)))

@@ -48,16 +48,44 @@
     reader))
 
 #?(:clje
-   (defn- source-logging-pushback-reader
-     "Return a reader over `code` that reports positions from `line` and
-  `column`. clojerl readers always start at line 1 and column 1, so the
-  code gets that many newlines and spaces in front."
-     [code line column]
-     (bytes/char-reader
-      (bytes/binary-input
-       (str (apply str (repeat (dec (or line 1)) "\n"))
-            (apply str (repeat (dec (or column 1)) " "))
-            code)))))
+   (defn- position-after
+     "Return [line column] of the character after `text`, where `text`
+  starts at `line` and `column`."
+     [text line column]
+     (let [newlines (binary/matches text "\n")]
+       (if (empty? newlines)
+         [line (+ column (count text))]
+         (let [start (inc (erlang/element 1 (last newlines)))]
+           [(+ line (count newlines))
+            (inc (count (erlang/binary_part text start (- (erlang/byte_size text) start))))])))))
+
+#?(:clje
+   (defn- source-form-reader
+     "Return a function that reads the next form of the string `code` with
+  `read-fn` and `opts`. Positions start at `line` and `column`. `state` is a
+  process-val that the function keeps its position in.
+
+  Each clojerl read starts a new reader state at line 1 and column 1. So
+  each read gets a reader over the rest of the code, with newlines and
+  spaces in front that move it to its real position."
+     [code line column read-fn opts state]
+     ;; The arithmetic fails here on a line or column that is not a number,
+     ;; outside the error handling of the eval, as the JVM version does.
+     (vreset! state [0 (+ 0 (or line 1)) (+ 0 (or column 1))])
+     (fn []
+       (let [[done l c] @state
+             size (erlang/byte_size code)
+             input (bytes/binary-input
+                    (str (apply str (repeat (dec l) "\n"))
+                         (apply str (repeat (dec c) " "))
+                         (erlang/binary_part code done (- size done))))
+             form (read-fn opts (bytes/char-reader input))
+             ;; The reader pushes back the character after the form, so it is
+             ;; still in the input.
+             done' (- size (erlang/byte_size (bytes/remaining input)))
+             [l' c'] (position-after (erlang/binary_part code done (- done' done)) l c)]
+         (vreset! state [done' l' c'])
+         form))))
 
 (#?(:clj defn- :clje comment) interrupted?
   "Returns true if the given throwable was ultimately caused by an interrupt."
@@ -232,12 +260,12 @@
              explicit-ns (some-> ns symbol find-ns)
              eof (erlang/make_ref)
              errored? (process-val! false)
+             position (process-val! nil)
              read-cond (keyword (:read-cond msg :allow))
              read-opts (cond-> {:read-cond read-cond :eof eof}
                          file (assoc :file file))
              read (cond (string? code)
-                        (let [reader (source-logging-pushback-reader code line column)]
-                          #(read-fn read-opts reader))
+                        (source-form-reader code line column read-fn read-opts position)
 
                         ;; Special case, only used for TTY transport.
                         (satisfies? erlang.io.IPushbackReader code)
@@ -275,7 +303,8 @@
                           (fn [kind e st]
                             ;; If error happens during read phase, call
                             ;; caught-hook but don't continue executing.
-                            (caught kind (ex-info nil {:clojure.error/phase :read-source} e) st)
+                            ;; clojerl ex-info needs a message, so it gets "".
+                            (caught :error (ex-info "" {:clojure.error/phase :read-source} (compat/as-error kind e)) st)
                             eof))]
                (when-not (= input eof)
                  (run-catching
@@ -290,8 +319,8 @@
                         (t/respond-to msg {:ns (str (ns-name *ns*))
                                            :value value
                                            ::print/keys #{:value}}))
-                      (fn [_kind e _st]
-                        (throw (ex-info nil {:clojure.error/phase :print-eval-result} e)))))
+                      (fn [kind e _st]
+                        (throw (ex-info "" {:clojure.error/phase :print-eval-result} (compat/as-error kind e))))))
                   caught)
                  ;; Otherwise, when errors happen during eval/print phase,
                  ;; report the exception but continue executing the
@@ -307,6 +336,7 @@
                (skip-stdin-newline)
                (catch _ _))
              (.destroy errored?)
+             (.destroy position)
              (pop-thread-bindings)))))))
 
 (defn interruptible-eval

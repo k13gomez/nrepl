@@ -17,11 +17,11 @@
     nil))
 
 (defn- flush-buffer
-  "Call `callback` with the part of `buf` to send now, and return the rest.
-  See `split-buffer` for which part goes out."
+  "Call `callback` with each part of `buf` to send now, and return the rest.
+  See `split-buffer` for which parts go out."
   [callback buffer-size buf force?]
-  (let [[text rest] (split-buffer buffer-size buf force?)]
-    (when text (callback text))
+  (let [[texts rest] (split-buffer buffer-size buf force?)]
+    (run! callback texts)
     rest))
 
 (defn- writer-loop [callback buffer-size buf]
@@ -57,26 +57,37 @@
   clojerl.IStringable
   (str [_] (str "#<nrepl.beam.io.CallbackWriter " (pr-str pid) ">")))
 
-(defn- split-buffer
-  "Return [text rest]: the part of `buf` to send now, and the part to keep.
-  Send all of `buf` if `force?` is true or `buf` reached `buffer-size`.
-  Otherwise send up to the last newline. `text` is nil if nothing goes out."
-  [buffer-size buf force?]
+(defn- char-boundary
+  "Return the first index at or after `i` where a UTF-8 character of `buf`
+  starts, or the size of `buf`."
+  [buf i]
   (let [size (erlang/byte_size buf)]
-    (cond
-      (zero? size)
-      [nil buf]
+    (loop [i i]
+      (if (and (< i size) (= 2r10 (bit-shift-right (binary/at buf i) 6)))
+        (recur (inc i))
+        i))))
 
-      (or force? (>= size buffer-size))
-      [buf ""]
-
-      :else
-      (let [newlines (binary/matches buf "\n")]
-        (if (empty? newlines)
-          [nil buf]
-          (let [end (inc (erlang/element 1 (last newlines)))]
-            [(erlang/binary_part buf 0 end)
-             (erlang/binary_part buf end (- size end))]))))))
+(defn- split-buffer
+  "Return [texts rest]: the parts of `buf` to send now, and the part to keep.
+  Like the JVM CallbackBufferedOutputStream, it sends `buffer-size` bytes at
+  a time without tearing a UTF-8 character. Of the rest, it sends all if
+  `force?` is true, and otherwise up to the last newline."
+  [buffer-size buf force?]
+  (loop [texts []
+         buf buf]
+    (let [size (erlang/byte_size buf)]
+      (if (> size buffer-size)
+        (let [end (char-boundary buf buffer-size)]
+          (recur (conj texts (erlang/binary_part buf 0 end))
+                 (erlang/binary_part buf end (- size end))))
+        (let [newlines (when-not force? (binary/matches buf "\n"))
+              end (cond
+                    (zero? size) 0
+                    (or force? (= size buffer-size)) size
+                    (seq newlines) (inc (erlang/element 1 (last newlines)))
+                    :else 0)]
+          [(cond-> texts (pos? end) (conj (erlang/binary_part buf 0 end)))
+           (erlang/binary_part buf end (- size end))])))))
 
 ;; Session output servers. A session has one for *out* and one for *err*.
 ;; It outlives each message, so output from a future still reaches the
@@ -105,11 +116,10 @@
   "Add `text` to message state `st`, and send what is due. Return the new
   state."
   [stream buffer-size st text force?]
-  (let [[out buf] (split-buffer buffer-size
-                                (erlang/iolist_to_binary #erl((:buf st) text))
-                                force?)
-        st (assoc st :buf buf)]
-    (if out (send-output stream st out) st)))
+  (let [[texts buf] (split-buffer buffer-size
+                                  (erlang/iolist_to_binary #erl((:buf st) text))
+                                  force?)]
+    (reduce #(send-output stream %1 %2) (assoc st :buf buf) texts)))
 
 (defn- output-loop
   "Serve the output of a session. `msgs` maps each message to its state.

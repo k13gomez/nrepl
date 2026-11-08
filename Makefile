@@ -30,7 +30,8 @@ clje-compile:
 
 # The test namespaces that run on the BEAM so far. Each milestone adds its
 # ported tests here.
-CLJE_TEST_NS ?= nrepl.bencode-test nrepl.middleware.session-test nrepl.util.out-test
+CLJE_TEST_NS ?= nrepl.bencode-test nrepl.middleware.session-test nrepl.util.out-test \
+	nrepl.middleware.interruptible-eval-test nrepl.middleware.load-file-test nrepl.middleware.print-test
 
 clje-test: clje-compile
 	for ns in $(if $(CLJE_NS),$(CLJE_NS),$(CLJE_TEST_NS)); do \
