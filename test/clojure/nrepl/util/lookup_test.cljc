@@ -55,7 +55,7 @@
 
     (testing "by its alias"
       (is+ {:name "nrepl.bencode"
-            :file #"nrepl/bencode\.clj$"}
+            :file #"nrepl/bencode\.cljc$"}
            (lookup 'nrepl.util.lookup-test 'bencode)))
 
     (testing "from a .cljc file"

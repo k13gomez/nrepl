@@ -5,4 +5,7 @@
                      :unresolved-symbol  {:exclude [(clojure.test/is [match?])]}
                      :consistent-alias   {:aliases {clojure.string str}}
                      ;; Enable this opt-in linter:
-                     :unsorted-required-namespaces {:level :warning}}}
+                     :unsorted-required-namespaces {:level :warning}}
+ ;; The .cljc sources target the JVM (:clj) and clojerl (:clje).
+ ;; kondo cannot lint :clje, so lint only :clj and not :cljs.
+ :cljc              {:features [:clj]}}
