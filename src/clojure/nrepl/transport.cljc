@@ -136,6 +136,21 @@
         transport))))
 
 #?(:clje
+   (defn- edn-safe
+     "Return `x` with Erlang lists, maps and tuples turned into Clojure data.
+  clojerl prints them with an #erl tag, which an EDN reader cannot read.
+  For example, clojerl `keys` returns an Erlang list."
+     [x]
+     (cond
+       (erlang/is_list x) (mapv edn-safe x)
+       (erlang/is_tuple x) (mapv edn-safe (erlang/tuple_to_list x))
+       (map? x) (into {} (map (fn [[k v]] [(edn-safe k) (edn-safe v)])) x)
+       (set? x) (into #{} (map edn-safe) x)
+       (vector? x) (mapv edn-safe x)
+       (seq? x) (map edn-safe x)
+       :else x)))
+
+#?(:clje
    (defn- disconnected-error
      "Return the error for a lost connection. The JVM throws a
   SocketException, which the BEAM does not have."
@@ -270,7 +285,7 @@
            (binding [*print-readably* true
                      *print-length*   nil
                      *print-level*    nil]
-             (socket/write out #?(:clj (.getBytes ^String (str %) "UTF-8") :clje (str %)))
+             (socket/write out #?(:clj (.getBytes ^String (str %) "UTF-8") :clje (str (edn-safe %))))
              #?(:clj (.flush ^Flushable out)))))
       (fn []
         (if s

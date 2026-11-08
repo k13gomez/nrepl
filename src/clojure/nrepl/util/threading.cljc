@@ -29,8 +29,9 @@
                  (run [_#]
                    ~@body)))
      ;; The BEAM runs `body` in a new process. The executor form is not
-     ;; evaluated, so the executors below do not exist on clje.
-     :clje `(erlang/spawn (fn [] ~@body))))
+     ;; evaluated, so the executors below do not exist on clje. Like a task
+     ;; that a JVM executor runs, an error in `body` is dropped.
+     :clje `(erlang/spawn (fn [] (try ~@body (catch ~'_ _# nil))))))
 
 ;; Executors are wrapped in delays to defer their initialization.
 

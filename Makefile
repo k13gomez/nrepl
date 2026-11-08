@@ -18,8 +18,8 @@ javac-test:
 test: javac-test
 	clojure -M:$(CLOJURE_VERSION):dev:test$(EXTRA_ALIASES)
 
-# BEAM build for clojerl. Set CLJE_NS to test one namespace, for example
-# CLJE_NS=nrepl.bencode-test make clje-test.
+# BEAM build for clojerl. Set CLJE_NS to test only some namespaces, for
+# example CLJE_NS=nrepl.bencode-test make clje-test.
 # The nrepl namespaces always build from clean. rebar3_clojerl does not
 # recompile the namespaces that extend a protocol when the protocol changes.
 # Only the nrepl.* beams go: the nrepl ebin also holds protocol modules of
@@ -28,8 +28,14 @@ clje-compile:
 	rm -f _build/test/lib/nrepl/ebin/nrepl.*.beam
 	rebar3 as test clojerl compile
 
+# The test namespaces that run on the BEAM so far. Each milestone adds its
+# ported tests here.
+CLJE_TEST_NS ?= nrepl.bencode-test nrepl.middleware.session-test nrepl.util.out-test
+
 clje-test: clje-compile
-	rebar3 as test clojerl test $(if $(CLJE_NS),--ns $(CLJE_NS))
+	for ns in $(if $(CLJE_NS),$(CLJE_NS),$(CLJE_TEST_NS)); do \
+		rebar3 as test clojerl test --ns $$ns || exit 1; \
+	done
 
 eastwood: javac-test
 	clojure -M:eastwood:+junixsocket

@@ -3,26 +3,26 @@
   `CallbackBufferedOutputStream` and `PrintWriter` stack in
   `nrepl.middleware.print`.")
 
+(declare split-buffer)
+
+(defn- call
+  "Send `[tag self ref & args]` to `pid` and wait for its `[ref ok]` reply.
+  Return nil, also if `pid` is gone."
+  [pid tag & args]
+  (let [ref (erlang/monitor :process pid)]
+    (erlang/send pid (erlang/list_to_tuple (clj_rt/to_list (concat [tag (erlang/self) ref] args))))
+    (receive*
+     #erl[ref :ok] (erlang/demonitor ref #erl(:flush))
+     #erl[:DOWN ref _ _ _] nil)
+    nil))
+
 (defn- flush-buffer
   "Call `callback` with the part of `buf` to send now, and return the rest.
-  Send all of `buf` if `force?` is true or `buf` reached `buffer-size`.
-  Otherwise send up to the last newline."
+  See `split-buffer` for which part goes out."
   [callback buffer-size buf force?]
-  (let [size (erlang/byte_size buf)]
-    (cond
-      (zero? size)
-      buf
-
-      (or force? (>= size buffer-size))
-      (do (callback buf) "")
-
-      :else
-      (let [newlines (binary/matches buf "\n")]
-        (if (empty? newlines)
-          buf
-          (let [end (inc (erlang/element 1 (last newlines)))]
-            (callback (erlang/binary_part buf 0 end))
-            (erlang/binary_part buf end (- size end))))))))
+  (let [[text rest] (split-buffer buffer-size buf force?)]
+    (when text (callback text))
+    rest))
 
 (defn- writer-loop [callback buffer-size buf]
   (receive*
@@ -38,14 +38,6 @@
    #erl[:close from ref]
    (do (flush-buffer callback buffer-size buf true)
        (erlang/send from #erl[ref :ok]))))
-
-(defn- call [pid tag]
-  (let [ref (erlang/monitor :process pid)]
-    (erlang/send pid #erl[tag (erlang/self) ref])
-    (receive*
-     #erl[ref :ok] (erlang/demonitor ref #erl(:flush))
-     #erl[:DOWN ref _ _ _] nil)
-    nil))
 
 (deftype CallbackWriter [pid]
   erlang.io.IWriter
@@ -64,6 +56,150 @@
 
   clojerl.IStringable
   (str [_] (str "#<nrepl.beam.io.CallbackWriter " (pr-str pid) ">")))
+
+(defn- split-buffer
+  "Return [text rest]: the part of `buf` to send now, and the part to keep.
+  Send all of `buf` if `force?` is true or `buf` reached `buffer-size`.
+  Otherwise send up to the last newline. `text` is nil if nothing goes out."
+  [buffer-size buf force?]
+  (let [size (erlang/byte_size buf)]
+    (cond
+      (zero? size)
+      [nil buf]
+
+      (or force? (>= size buffer-size))
+      [buf ""]
+
+      :else
+      (let [newlines (binary/matches buf "\n")]
+        (if (empty? newlines)
+          [nil buf]
+          (let [end (inc (erlang/element 1 (last newlines)))]
+            [(erlang/binary_part buf 0 end)
+             (erlang/binary_part buf end (- size end))]))))))
+
+;; Session output servers. A session has one for *out* and one for *err*.
+;; It outlives each message, so output from a future still reaches the
+;; client. It is also the group leader of the session worker, so raw
+;; `io:format` output reaches the client too.
+
+(declare put-chars-text)
+
+(defn- new-message-state [msg respond quota]
+  {:msg msg :buf "" :remaining quota :respond respond})
+
+(defn- send-output
+  "Send `text` for message state `st` as a response with key `stream`,
+  within the quota of the message. Return the new state."
+  [stream {:keys [msg remaining respond] :as st} text]
+  (let [text (if (and remaining (> (count text) remaining))
+               (string/slice text 0 remaining)
+               text)]
+    (when (pos? (erlang/byte_size text))
+      ;; A response to a closed transport fails. The output is then lost,
+      ;; as it is on the JVM.
+      (try (respond msg stream text) (catch _ _ nil)))
+    (cond-> st remaining (update :remaining - (count text)))))
+
+(defn- write-message
+  "Add `text` to message state `st`, and send what is due. Return the new
+  state."
+  [stream buffer-size st text force?]
+  (let [[out buf] (split-buffer buffer-size
+                                (erlang/iolist_to_binary #erl((:buf st) text))
+                                force?)
+        st (assoc st :buf buf)]
+    (if out (send-output stream st out) st)))
+
+(defn- output-loop
+  "Serve the output of a session. `msgs` maps each message to its state.
+  `latest` is the [msg respond quota] of the message that raw I/O requests
+  write to."
+  [stream buffer-size msgs latest]
+  (let [state-of (fn [msgs msg respond quota]
+                   (or (get msgs msg) (new-message-state msg respond quota)))]
+    (receive*
+     #erl[:begin msg respond quota]
+     (recur stream buffer-size msgs [msg respond quota])
+
+     #erl[:write msg respond quota text]
+     (let [st (write-message stream buffer-size (state-of msgs msg respond quota) text false)]
+       (recur stream buffer-size (assoc msgs msg st) latest))
+
+     #erl[:flush from ref msg]
+     (let [msgs (if-let [st (get msgs msg)]
+                  (assoc msgs msg (write-message stream buffer-size st "" true))
+                  msgs)]
+       (erlang/send from #erl[ref :ok])
+       (recur stream buffer-size msgs latest))
+
+     #erl[:end from ref msg]
+     ;; Later output for the message, from a future, starts a new state.
+     (do (when-let [st (get msgs msg)]
+           (write-message stream buffer-size st "" true))
+         (erlang/send from #erl[ref :ok])
+         (recur stream buffer-size (dissoc msgs msg) latest))
+
+     #erl[:io_request from reply-as request]
+     (let [text (put-chars-text request)
+           msgs (if-let [[msg respond quota] (when text latest)]
+                  ;; A raw I/O request is synchronous, so send its text now.
+                  ;; It then goes out before any later response of the eval.
+                  (assoc msgs msg (write-message stream buffer-size
+                                                 (state-of msgs msg respond quota)
+                                                 text true))
+                  msgs)]
+       (erlang/send from #erl[:io_reply reply-as (if text :ok #erl[:error :enotsup])])
+       (recur stream buffer-size msgs latest))
+
+     :close
+     (doseq [[_ st] msgs]
+       (write-message stream buffer-size st "" true)))))
+
+(defn session-output
+  "Start an output server for the stream `stream` (`:out` or `:err`) of a
+  session. Return its pid."
+  [stream buffer-size]
+  (erlang/spawn (fn [] (output-loop stream buffer-size {} nil))))
+
+(defn begin-message
+  "Tell the output server `pid` that `msg` is the latest message. Raw I/O
+  requests write to it, with `(respond msg stream text)`, within `quota`
+  characters if it is not nil."
+  [pid msg respond quota]
+  (erlang/send pid #erl[:begin msg respond quota]))
+
+(defn end-message
+  "Send the buffered output of `msg` on the output server `pid`, and wait
+  until it went out."
+  [pid msg]
+  (call pid :end msg))
+
+(deftype ReplyingWriter [pid msg respond quota]
+  erlang.io.IWriter
+  (write [this s]
+    (if (= "" s)
+      ;; clojerl `flush` writes an empty string.
+      (call pid :flush msg)
+      (erlang/send pid #erl[:write msg respond quota s]))
+    this)
+  (write [this fmt args]
+    (.write this (erlang/iolist_to_binary (io_lib/format fmt args))))
+
+  erlang.io.ICloseable
+  (close [this]
+    ;; The session owns the server. Closing the writer only flushes it.
+    (.write this ""))
+
+  clojerl.IStringable
+  (str [_] (str "#<nrepl.beam.io.ReplyingWriter " (pr-str pid) ">")))
+
+(defn replying-writer
+  "Return a writer for `msg` on the session output server `pid`. Its text
+  goes out with `(respond msg stream text)`, within `quota` characters if
+  it is not nil. Writes still go out after the message is done."
+  [pid msg respond quota]
+  (ReplyingWriter. pid msg respond quota))
 
 (defn- put-chars-text
   "Return the text that the I/O request `request` writes, or nil if it
@@ -88,23 +224,25 @@
         (let [texts (keep put-chars-text (erlang/element 2 request))]
           (when (seq texts) (apply str texts)))))))
 
-(defn- tee-loop [device callback]
+(defn- tee-loop [device callback buf]
   (receive*
    #erl[:io_request from reply-as request]
-   (let [result (io/request device request)]
+   (let [result (io/request device request)
+         text (put-chars-text request)]
      (erlang/send from #erl[:io_reply reply-as result])
-     (when-let [text (put-chars-text request)]
-       (callback text))
-     (recur device callback))
+     (recur device callback (if text
+                              (flush-buffer callback 1024 (erlang/iolist_to_binary #erl(buf text)) false)
+                              buf)))
 
    _
-   (recur device callback)))
+   (recur device callback buf)))
 
 (defn tee-device
   "Start an I/O server that forwards each request to the I/O device
-  `device`, and calls `callback` with the text of each write. Return its pid."
+  `device`. It buffers the text of the writes like `callback-writer`, and
+  calls `callback` with each complete line. Return its pid."
   [device callback]
-  (erlang/spawn (fn [] (tee-loop device callback))))
+  (erlang/spawn (fn [] (tee-loop device callback ""))))
 
 (defn callback-writer
   "Return a writer that buffers its text and calls `callback` with it. It

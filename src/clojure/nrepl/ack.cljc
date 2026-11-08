@@ -20,7 +20,7 @@
   ;; save people the misery of ever trying to deref the empty promise in their REPL
   nil)
 
-(defn wait-for-ack
+(#?(:clj defn :clje comment) wait-for-ack
   "Waits for a presumably just-launched nREPL server to connect and
    deliver its port number.  Returns that number if it's delivered
    within `timeout` ms, otherwise nil.  Assumes that `ack`
@@ -36,6 +36,15 @@
   (let [f (future @@ack-port-promise)]
     (deref f timeout nil)))
 
+#?(:clje
+   (defn wait-for-ack
+     "Waits for a presumably just-launched nREPL server to connect and
+   deliver its port number.  Returns that number if it's delivered
+   within `timeout` ms, otherwise nil. A clojerl promise can wait with a
+   timeout, so there is no future."
+     [timeout]
+     (deref @ack-port-promise timeout nil)))
+
 (defn handle-ack
   "Middleware that handles the \"ack\" op by delivering the port value
   to the ack port promise."
@@ -46,7 +55,7 @@
       (try
         (deliver @ack-port-promise port)
         (t/send transport {:status :done})
-        (catch Throwable _e)))))
+        (catch #?(:clj Throwable :clje _) _e)))))
 
 ;; TODO: could stand to have some better error handling around all of this
 (defn send-ack
@@ -55,8 +64,8 @@
   ([my-port ack-port]
    (send-ack my-port ack-port t/bencode))
   ([my-port ack-port transport-fn]
-   (with-open [^java.io.Closeable transport (nrepl/connect :transport-fn transport-fn
-                                                           :port ack-port)]
+   (with-open [^#?(:clj java.io.Closeable :clje erlang.io.ICloseable) transport (nrepl/connect :transport-fn transport-fn
+                                                                                               :port ack-port)]
      (let [client (nrepl/client transport 1000)]
        ;; consume response from the server, solely to let that side
        ;; finish cleanly without (by default) spewing a SocketException when

@@ -2,8 +2,9 @@
   (:require [clojure.test :refer :all]
             [clojure.string :as str]
             [nrepl.test-helpers :refer [is+ newline->sys]]
-            [nrepl.util.out :as out])
-  (:import nrepl.out.CallbackBufferedOutputStream))
+            [nrepl.util.out :as out]
+            #?(:clje [nrepl.beam.io :as beam-io]))
+  #?(:clj (:import nrepl.out.CallbackBufferedOutputStream)))
 
 (defn- reset-callbacks-fixture
   "Helper to reset the internal state for testing."
@@ -18,14 +19,14 @@
   Callbacks are invoked on nREPL's transport executor, so the tests have to
   wait for them to have run instead of assuming they already have."
   [pred timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+  (let [deadline (+ #?(:clj (System/currentTimeMillis) :clje (erlang/system_time :millisecond)) timeout-ms)]
     (loop []
       (or (pred)
-          (when (< (System/currentTimeMillis) deadline)
-            (Thread/sleep 10)
+          (when (< #?(:clj (System/currentTimeMillis) :clje (erlang/system_time :millisecond)) deadline)
+            #?(:clj (Thread/sleep 10) :clje (timer/sleep 10))
             (recur))))))
 
-(deftest test-wrap-standard-streams-idempotency
+(#?(:clj deftest :clje comment) test-wrap-standard-streams-idempotency
   (testing "wrap-standard-streams is idempotent"
     (let [original-out (:out @@#'out/original-print-streams)
           original-err (:err @@#'out/original-print-streams)]
@@ -41,7 +42,7 @@
         (is (identical? first-out System/out))
         (is (identical? first-err System/err))))))
 
-(deftest test-output-interception
+(#?(:clj deftest :clje comment) test-output-interception
   (testing "callbacks are invoked when output is written"
     (out/wrap-standard-streams)
     (let [out-calls (atom [])
@@ -61,7 +62,7 @@
       (is+ [[:test3 (newline->sys "Hello stderr\n")]]
            @err-calls))))
 
-(deftest test-root-binding-updates
+(#?(:clj deftest :clje comment) test-root-binding-updates
   (testing "*out* and *err* root bindings are updated to point to wrapped streams"
     (out/wrap-standard-streams)
     (let [out-calls (atom [])
@@ -82,7 +83,7 @@
       (is+ [[:test3 (newline->sys "Hello stderr\n")]]
            @err-calls))))
 
-(deftest test-error-handling-in-callbacks
+(#?(:clj deftest :clje comment) test-error-handling-in-callbacks
   (testing "exceptions in one callback shouldn't break others"
     (out/wrap-standard-streams)
     (let [out-calls (atom [])]
@@ -96,7 +97,7 @@
       (is+ (vec (repeat 10 (newline->sys "1\n")))
            @out-calls))))
 
-(deftest test-multibyte-character-handling
+(#?(:clj deftest :clje comment) test-multibyte-character-handling
   (doseq [buffer-len (range 10 20)
           prefix-len (range 1 (inc buffer-len))]
     (let [chunks   (atom [])
@@ -109,3 +110,64 @@
       (.flush stream)
       (is (str/ends-with? (last @chunks) "☀") (str @chunks))
       (is (every? #{\- \☀} (apply str @chunks)) (str @chunks)))))
+
+;; The BEAM versions. The tee captures the standard output of the VM through
+;; group leaders. Standard error is a registered device that it cannot
+;; replace, so the :err callbacks do not run on the BEAM.
+
+#?(:clje
+   (deftest test-wrap-standard-streams-idempotency
+     (testing "wrap-standard-streams is idempotent"
+       (out/wrap-standard-streams)
+       (let [tee (erlang/group_leader)]
+         (is (not= (erlang/whereis :user) tee))
+         (out/wrap-standard-streams)
+         (is (= tee (erlang/group_leader)))))))
+
+#?(:clje
+   (deftest test-output-interception
+     (testing "callbacks are invoked when output is written"
+       (out/wrap-standard-streams)
+       (let [out-calls (atom [])]
+         (out/set-callback :out :test1 #(swap! out-calls conj [:test1 %]))
+         (out/set-callback :out :test2 #(swap! out-calls conj [:test2 %]))
+         (io/format "Hello stdout~n")
+         (wait-for #(= 2 (count @out-calls)) 5000)
+         (is+ #{[:test1 "Hello stdout\n"]
+                [:test2 "Hello stdout\n"]}
+              (set @out-calls))))))
+
+#?(:clje
+   (deftest test-root-binding-updates
+     (testing "processes started later write through the tee"
+       (out/wrap-standard-streams)
+       (let [out-calls (atom [])]
+         (out/set-callback :out :test1 #(swap! out-calls conj [:test1 %]))
+         (erlang/spawn (fn [] (binding [*out* :standard_io] (println "Hello stdout"))))
+         (wait-for #(= 1 (count @out-calls)) 5000)
+         (is+ [[:test1 "Hello stdout\n"]] @out-calls)))))
+
+#?(:clje
+   (deftest test-error-handling-in-callbacks
+     (testing "exceptions in one callback shouldn't break others"
+       (out/wrap-standard-streams)
+       (let [out-calls (atom [])]
+         (out/set-callback :out ::bad-callback #(/ 1 %))
+         (out/set-callback :out ::good-callback #(swap! out-calls conj %))
+         (dotimes [_ 10]
+           (io/format "1~n"))
+         (wait-for #(= 10 (count @out-calls)) 5000)
+         (is+ (vec (repeat 10 "1\n"))
+              @out-calls)))))
+
+#?(:clje
+   (deftest test-multibyte-character-handling
+     (doseq [buffer-len (range 10 20)
+             prefix-len (range 1 (inc buffer-len))]
+       (let [chunks (atom [])
+             writer (beam-io/callback-writer #(swap! chunks conj %) buffer-len)]
+         (erlang.io.IWriter/write writer (apply str (repeat prefix-len "-")))
+         (erlang.io.IWriter/write writer "☀")
+         (.close writer)
+         (is (str/ends-with? (last @chunks) "☀") (str @chunks))
+         (is (every? #{"-" "☀"} (map str (apply str @chunks))) (str @chunks))))))

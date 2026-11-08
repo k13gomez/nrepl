@@ -1,10 +1,10 @@
 (ns nrepl.core-test
   (:require
-   [clojure.java.io :as io]
+   #?(:clj [clojure.java.io :as io])
    [clojure.main]
    [clojure.set :as set]
    [clojure.spec.alpha]
-   [clojure.stacktrace :refer [root-cause]]
+   #?(:clj [clojure.stacktrace :refer [root-cause]])
    [clojure.test :refer [are deftest is testing use-fixtures]]
    [matcher-combinators.matchers :as mc]
    [nrepl.core :as nrepl :refer [client
@@ -24,18 +24,22 @@
    [nrepl.misc :refer [uuid]]
    [nrepl.server :as server]
    [nrepl.test-helpers :as th :refer [is+ win?]]
-   [nrepl.util.classloader]
+   #?(:clj [nrepl.util.classloader])
    [nrepl.util.session :as session-util]
    [nrepl.util.threading :as threading]
-   [nrepl.transport :as transport])
-  (:import
-   (java.io File Writer)
-   java.net.SocketException
-   (nrepl.server Server)))
+   [nrepl.transport :as transport]
+   #?(:clje [nrepl.beam.compat :refer [format]]))
+  #?(:clj
+     (:import
+      (java.io File Writer)
+      java.net.SocketException
+      (nrepl.server Server))
+     :clje
+     (:refer-clojure :exclude [format])))
 
 (require 'nrepl.spec) ;; Load for side effects (register specs).
 
-(deftest version-sanity-check
+(#?(:clj deftest :clje comment) version-sanity-check
   (is (let [v (System/getenv "CLOJURE_VERSION")]
         (println "Running on Clojure" (clojure-version) ", expected:" v)
         (or (nil? v) (.startsWith ^String (clojure-version) v)))))
@@ -45,14 +49,16 @@
   {#'transport/bencode "nrepl"
    #'transport/edn "nrepl+edn"})
 
-(def ^File project-base-dir (File. (System/getProperty "nrepl.basedir" ".")))
+(#?(:clj def :clje comment) ^File project-base-dir (File. (System/getProperty "nrepl.basedir" ".")))
 
-(def ^:dynamic ^nrepl.server.Server  *server* nil)
+#?(:clje (def project-base-dir "."))
+
+(def ^:dynamic ^#?(:clj nrepl.server.Server :clje erlang.Type)  *server* nil)
 (def ^:dynamic *transport-fn* nil)
 
 (defn start-server-for-transport-fn
   [transport-fn f]
-  (with-open [^Server server (server/start-server :transport-fn transport-fn)]
+  (with-open [^#?(:clj Server :clje erlang.Type) server (server/start-server :transport-fn transport-fn)]
     (binding [*server* server
               *transport-fn* transport-fn]
       (testing (format "transport:%s -" (-> transport-fn meta :name))
@@ -73,11 +79,11 @@
 (use-fixtures :each repl-server-fixture)
 
 (defmacro with-repl-server [& body]
-  `(with-open [^nrepl.transport.FnTransport
+  `(with-open [^#?(:clj nrepl.transport.FnTransport :clje erlang.Type)
                transport# (connect :port (:port *server*)
                                    :transport-fn *transport-fn*)]
      (let [~'transport transport#
-           ~'client (client transport# Long/MAX_VALUE)
+           ~'client (client transport# #?(:clj Long/MAX_VALUE :clje :infinity))
            ~'session (client-session ~'client)
            ~'timeout-client (client transport# 1000)
            ;; Clone through `client` so that a slow server can't fail the
@@ -134,7 +140,7 @@
       (not (strict-transport?)) keywordize-truncated-keys
       (strict-transport?)       check-response-format)))
 
-(def-repl-test eval-literals
+(#?(:clj def-repl-test :clje comment) eval-literals
   (are [literal] (= (binding [*ns* (find-ns 'user)] ; needed for the ::keyword
                       (-> literal read-string eval list))
                     (repl-values client literal))
@@ -158,12 +164,12 @@
   (is (= (->> "#\"regex\"" read-string eval list (map str))
          (->> "#\"regex\"" (repl-values client) (map str)))))
 
-(def-repl-test simple-expressions
+(#?(:clj def-repl-test :clje comment) simple-expressions
   (are [expr] (= [(eval expr)] (repl-values client (pr-str expr)))
     '(range 40)
     '(apply + (range 100))))
 
-(def-repl-test defining-fns
+(#?(:clj def-repl-test :clje comment) defining-fns
   (repl-values client "(defn x [] 6)")
   (is (= [6] (repl-values client "(x)"))))
 
@@ -174,13 +180,13 @@
       (- result)
       result)))
 
-(def-repl-test use-alternative-eval-fn
+(#?(:clj def-repl-test :clje comment) use-alternative-eval-fn
   (is+ {:value ["-124750"]}
        (-> (message timeout-client {:op "eval" :eval "nrepl.core-test/dumb-alternative-eval"
                                     :code "(reduce + (range 500))"})
            combine-responses)))
 
-(def-repl-test source-tracking-eval
+(#?(:clj def-repl-test :clje comment) source-tracking-eval
   (let [sym (name (gensym))
         request {:op "eval" :ns "user" :code (format "(def %s 1000)" sym)
                  :file "test.clj" :line 42 :column 10}]
@@ -188,19 +194,19 @@
     (is+ {:file "test.clj", :line 42, :column 10}
          (meta (resolve (symbol "user" sym))))))
 
-(def-repl-test no-code
+(#?(:clj def-repl-test :clje comment) no-code
   (is+ {:status #{:error :no-code :done}}
        (-> (message timeout-client {:op "eval"})
            combine-responses
            clean-response)))
 
-(def-repl-test unknown-op
+(#?(:clj def-repl-test :clje comment) unknown-op
   (is+ {:op "abc" :status #{:error :unknown-op :done}}
        (-> (message timeout-client {:op "abc"})
            combine-responses
            clean-response)))
 
-(def-repl-test session-lifecycle
+(#?(:clj def-repl-test :clje comment) session-lifecycle
   (is+ {:status #{:error :unknown-session :done}}
        (-> (message timeout-client {:session "00000000-0000-0000-0000-000000000000"})
            combine-responses
@@ -220,22 +226,22 @@
              clean-response))
     (is (not (session-alive?)))))
 
-(def-repl-test separate-value-from-*out*
+(#?(:clj def-repl-test :clje comment) separate-value-from-*out*
   (is+ {:value [nil] :out (th/newline->sys "5\n")}
        (-> (map read-response-value (repl-eval client "(println 5)"))
            combine-responses)))
 
-(def-repl-test sessionless-*out*
+(#?(:clj def-repl-test :clje comment) sessionless-*out*
   (is+ {:out (th/newline->sys "5\n:foo\n")}
        (-> (repl-eval client "(println 5)(println :foo)")
            combine-responses)))
 
-(def-repl-test session-*out*
+(#?(:clj def-repl-test :clje comment) session-*out*
   (is+ {:out (th/newline->sys "5\n:foo\n")}
        (-> (repl-eval session "(println 5)(println :foo)")
            combine-responses)))
 
-(def-repl-test error-on-lazy-seq-with-side-effects
+(#?(:clj def-repl-test :clje comment) error-on-lazy-seq-with-side-effects
   (let [expression '(let [foo (fn [] (map (fn [x]
                                             (println x)
                                             (throw (Exception. "oops")))
@@ -246,7 +252,7 @@
          (-> (repl-eval session (pr-str expression))
              combine-responses))))
 
-(def-repl-test cross-transport-*out*
+(#?(:clj def-repl-test :clje comment) cross-transport-*out*
   (let [sid (-> session meta ::nrepl/taking-until :session)]
     (with-open [^nrepl.transport.FnTransport
                 transport2 (connect :port (:port *server*)
@@ -260,21 +266,21 @@
                   (take-while identity)
                   (mapv clean-response)))))))
 
-(def-repl-test streaming-out
+(#?(:clj def-repl-test :clje comment) streaming-out
   (is (= (for [x (range 10)]
            (str x th/sys-newline))
          (->> (repl-eval client "(dotimes [x 10] (println x))")
               (map :out)
               (remove nil?)))))
 
-(def-repl-test session-*out*-writer-length-translation
+(#?(:clj def-repl-test :clje comment) session-*out*-writer-length-translation
   (is+ {:out (th/newline->sys "#inst \"2013-02-11T12:13:44.000+00:00\"\n")}
        (-> (repl-eval session
                       (code (println (doto (java.util.GregorianCalendar. 2013 1 11 12 13 44)
                                        (.setTimeZone (java.util.TimeZone/getTimeZone "GMT"))))))
            combine-responses)))
 
-(def-repl-test streaming-out-without-explicit-flushing-buffers-1024-bytes
+(#?(:clj def-repl-test :clje comment) streaming-out-without-explicit-flushing-buffers-1024-bytes
   (testing "new session"
     (is+ [(mc/via count 1024)
           (mc/via count 1024)
@@ -290,7 +296,7 @@
          (->> (message session {:op "eval" :code (code (print (range 1000)))})
               (keep :out)))))
 
-(def-repl-test out-quota-test
+(#?(:clj def-repl-test :clje comment) out-quota-test
   (testing "new session"
     (is+ ["(0 1 "]
          (->> (message client {:op "eval" :out-quota 5 :code (code (print (range 1000)))})
@@ -308,7 +314,7 @@
                                                                       (print (range 1000))))})
               (keep :err)))))
 
-(def-repl-test reader-conditional-option
+(#?(:clj def-repl-test :clje comment) reader-conditional-option
   (is+ {:value ["#?(:clj (+ 1 2) :cljs (+ 2 3))"]}
        (->> (message client {:op "eval" :read-cond :preserve
                              :code "#?(:clj (+ 1 2) :cljs (+ 2 3))"})
@@ -317,12 +323,12 @@
        (->> (message client {:op "eval" :code "#?(:clj (+ 1 2) :cljs (+ 2 3))"})
             combine-responses)))
 
-(def-repl-test ensure-whitespace-prints
+(#?(:clj def-repl-test :clje comment) ensure-whitespace-prints
   (is+ {:out (str " \t \n \f " th/sys-newline)}
        (->> (repl-eval client "(println \" \t \n \f \")")
             combine-responses)))
 
-(def-repl-test streamed-printing
+(#?(:clj def-repl-test :clje comment) streamed-printing
   (testing "multiple forms"
     (let [responses (->> (message client {:op "eval"
                                           :code (code (range 10)
@@ -365,7 +371,7 @@
       (is+ {:value #"^\(0 1 2 3"} (first eval-responses))
       (is (= {:status #{:done :interrupted}} (last eval-responses))))))
 
-(def-repl-test session-return-recall
+(#?(:clj def-repl-test :clje comment) session-return-recall
   (testing "sessions persist across connections"
     (dorun (repl-values session (code
                                  (apply + (range 6))
@@ -385,13 +391,13 @@
   (testing "without a session id, REPL-bound vars like *1 have default values"
     (is (= [nil] (repl-values client "*1")))))
 
-(def-repl-test session-set!
+(#?(:clj def-repl-test :clje comment) session-set!
   (dorun (repl-eval session (code
                              (set! *compile-path* "badpath")
                              (set! *warn-on-reflection* true))))
   (is (= [["badpath" true]] (repl-values session (code [*compile-path* *warn-on-reflection*])))))
 
-(def-repl-test exceptions
+(#?(:clj def-repl-test :clje comment) exceptions
   (is+ {:status #{:eval-error :done}
         :value  mc/absent
         :err    #"bad, bad code"}
@@ -401,10 +407,10 @@
            clean-response))
   (is (= [true] (repl-values session "(.contains (str *e) \"bad, bad code\")"))))
 
-(def-repl-test multiple-expressions-return
+(#?(:clj def-repl-test :clje comment) multiple-expressions-return
   (is (= [5 18] (repl-values session "5 (/ 5 0) (+ 5 6 7)"))))
 
-(def-repl-test return-on-incomplete-expr
+(#?(:clj def-repl-test :clje comment) return-on-incomplete-expr
   (is+ {:status #{:done :eval-error}
         :value mc/absent}
        (-> (repl-eval session "(missing paren")
@@ -413,7 +419,7 @@
   (is+ [#"EOF while reading"]
        (repl-values session "(-> *e Throwable->map :cause)")))
 
-(def-repl-test switch-ns
+(#?(:clj def-repl-test :clje comment) switch-ns
   (is+ {:ns "otherns"}
        (-> (repl-eval session "(ns otherns) (defn function [] 12)")
            combine-responses))
@@ -421,7 +427,7 @@
   (repl-eval session "(in-ns 'user)")
   (is (= [12] (repl-values session "(otherns/function)"))))
 
-(def-repl-test switch-ns-2
+(#?(:clj def-repl-test :clje comment) switch-ns-2
   (is+ {:ns "otherns"}
        (-> (repl-eval session (code
                                (ns otherns)
@@ -432,7 +438,7 @@
   (is (= [12] (repl-values session "(otherns/function)")))
   (is+ {:ns "user"} (-> (repl-eval session "nil") combine-responses)))
 
-(def-repl-test explicit-ns
+(#?(:clj def-repl-test :clje comment) explicit-ns
   (is+ {:ns "user"} (-> (repl-eval session "nil") combine-responses))
   (is+ {:ns "baz"} (-> (repl-eval session (code
                                            (def bar 5)
@@ -442,13 +448,13 @@
   ;; NREPL-72: :ns argument to eval shouldn't affect *ns* outside of the scope of that evaluation
   (is+ {:ns "baz"} (-> (repl-eval session "5") combine-responses)))
 
-(def-repl-test error-on-nonexistent-ns
+(#?(:clj def-repl-test :clje comment) error-on-nonexistent-ns
   (is+ {:status #{:error :namespace-not-found :done}}
        (-> (message timeout-client {:op "eval" :code "(+ 1 1)" :ns (name (gensym))})
            combine-responses
            clean-response)))
 
-(def-repl-test proper-response-ordering
+(#?(:clj def-repl-test :clje comment) proper-response-ordering
   (is+ [{:value mc/absent, :out (th/newline->sys "100\n")}    ; printed number
         {:value "nil", :out mc/absent}                        ; return val from println
         {:value "42", :out mc/absent}                         ; return val from `42`
@@ -456,7 +462,7 @@
        (->> (repl-eval client "(println 100) 42")
             (mapv clean-response))))
 
-(def-repl-test interrupt
+(#?(:clj def-repl-test :clje comment) interrupt
   (testing "registered session"
     (is+ {:status #{:done :session-idle}}
          (clean-response (first (message session {:op "interrupt"}))))
@@ -562,14 +568,14 @@
 
 ;; NREPL-66: ensure that bindings of implementation vars aren't captured by user sessions
 ;; (https://github.com/clojure-emacs/cider/issues/785)
-(def-repl-test ensure-no-*msg*-capture
+(#?(:clj def-repl-test :clje comment) ensure-no-*msg*-capture
   (let [[r1 r2 :as results] (repeatedly 2 #(repl-eval session "(println :foo)"))
         [ids ids2] (map #(set (map :id %)) results)
         [out1 out2] (map #(-> % combine-responses :out) results)]
     (is (empty? (clojure.set/intersection ids ids2)))
     (is (= (th/newline->sys ":foo\n") out1 out2))))
 
-(def-repl-test read-timeout
+(#?(:clj def-repl-test :clje comment) read-timeout
   (is (nil? (repl-values timeout-session "(Thread/sleep 1100) :ok")))
   ;; just getting the values off of the wire so the server side doesn't
   ;; toss a spurious stack trace when the client disconnects
@@ -577,7 +583,7 @@
                         (take-while (complement nil?))
                         response-values))))
 
-(def-repl-test concurrent-message-handling
+(#?(:clj def-repl-test :clje comment) concurrent-message-handling
   (testing "multiple messages can be handled on the same connection concurrently"
     (let [sessions (vec (repeatedly 3 #(client-session client)))
           start-time (System/currentTimeMillis)
@@ -591,18 +597,18 @@
                               [1000 500 0])]
       (is (apply > (map deref elapsed-times))))))
 
-(def-repl-test ensure-transport-closeable
+(#?(:clj def-repl-test :clje comment) ensure-transport-closeable
   (is (= [5] (repl-values session "5")))
   (is (instance? java.io.Closeable transport))
   (.close transport)
   (is (thrown? java.net.SocketException (repl-values session "5"))))
 
-(def-repl-test ensure-server-closeable
+(#?(:clj def-repl-test :clje comment) ensure-server-closeable
   (.close *server*)
   (Thread/sleep 100)
   (is (thrown? java.net.ConnectException (connect :port (:port *server*)))))
 
-(defn- disconnection-exception?
+(#?(:clj defn- :clje comment) disconnection-exception?
   [e]
   ;; thrown? should check for the root cause! The JDK reports a peer that went
   ;; away either as a reset or, once the transport notices the EOF, as the
@@ -611,7 +617,7 @@
     (and (instance? SocketException cause)
          (re-find #"(?i)(lost.*connection|socket closed|connection reset)" (.getMessage cause)))))
 
-(deftest transports-fail-on-disconnects
+(#?(:clj deftest :clje comment) transports-fail-on-disconnects
   (testing "Ensure that transports fail ASAP when the server they're connected to goes down."
     (let [^Server server (server/start-server :transport-fn *transport-fn*)
           ^nrepl.transport.FnTransport
@@ -639,7 +645,7 @@
       (Thread/sleep 100)
       (is (thrown? SocketException (transport/send transport {:op "eval" :code "(+ 5 1)"}))))))
 
-(deftest server-starts-with-minimal-configuration
+(#?(:clj deftest :clje comment) server-starts-with-minimal-configuration
   (testing "Ensure server starts with minimal configuration"
     (let [server (server/start-server)
           transport (connect :port (:port server))
@@ -648,7 +654,7 @@
            (-> (message client {:op "eval" :code "(- 4 1)"})
                combine-responses)))))
 
-(def-repl-test clients-fail-on-disconnects
+(#?(:clj def-repl-test :clje comment) clients-fail-on-disconnects
   (testing "Ensure that clients fail ASAP when the server they're connected to goes down."
     (let [resp (repl-eval client "1 2 3 4 5 6 7 8 9 10")]
       (is+ {:value "1"} (first resp))
@@ -669,7 +675,7 @@
     (Thread/sleep 100)
     (is (thrown? SocketException (repl-eval session "(+ 1 1)")))))
 
-(def-repl-test request-*in*
+(#?(:clj def-repl-test :clje comment) request-*in*
   (let [responses (repl-eval session "(read)")]
     (is+ {:status (mc/via #(map keyword %) [:need-input])} (first responses))
     (session {:op "stdin" :stdin "(1 2 3)"})
@@ -680,20 +686,20 @@
   (is+ ["b"] (repl-values session "(read-line)"))
   (is+ ["c"] (repl-values session "(read-line)")))
 
-(def-repl-test request-*in*-eof
+(#?(:clj def-repl-test :clje comment) request-*in*-eof
   (let [responses (repl-eval session "(read)")]
     (is+ {:status (mc/via #(map keyword %) [:need-input])} (first responses))
     (session {:op "stdin" :stdin []})
     (is+ nil? (response-values responses))))
 
-(def-repl-test request-*in*-eof-after-input
+(#?(:clj def-repl-test :clje comment) request-*in*-eof-after-input
   ;; EOF that arrives behind buffered input must still be reported, and not be
   ;; swallowed by the read that drains that input.
   (dorun (message timeout-session {:op "stdin" :stdin "abc"}))
   (dorun (message timeout-session {:op "stdin" :stdin []}))
   (is+ ["abc"] (repl-values timeout-session "(read-line)")))
 
-(def-repl-test closing-*in*-keeps-the-session-alive
+(#?(:clj def-repl-test :clje comment) closing-*in*-keeps-the-session-alive
   ;; `slurp` closes the reader it is handed. Doing that to *in* must not take
   ;; the session down: the eval still completes, and later evals on the same
   ;; session are still answered (though *in* itself stays closed).
@@ -701,14 +707,14 @@
   (is+ [""] (repl-values timeout-session "(slurp *in*)"))
   (is+ [2] (repl-values timeout-session "(+ 1 1)")))
 
-(def-repl-test rebinding-*in*-keeps-the-session-alive
+(#?(:clj def-repl-test :clje comment) rebinding-*in*-keeps-the-session-alive
   ;; *in* may be set! to any Reader, not only a PushbackReader.
   (dorun (repl-eval timeout-session
                     (code (set! *in* (java.io.BufferedReader. (java.io.StringReader. "hi\n"))))))
   (is+ ["hi"] (repl-values timeout-session "(read-line)"))
   (is+ [2] (repl-values timeout-session "(+ 1 1)")))
 
-(def-repl-test closing-*out*-keeps-the-session-alive
+(#?(:clj def-repl-test :clje comment) closing-*out*-keeps-the-session-alive
   ;; Flushing a closed *out* after the eval must not take the session down
   ;; either. *out* is rebound for every message, so the next eval gets a
   ;; working one again.
@@ -716,7 +722,7 @@
                     (code (set! *out* (doto (java.io.BufferedWriter. (java.io.StringWriter.)) .close)))))
   (is+ [2] (repl-values timeout-session "(+ 1 1)")))
 
-(def-repl-test request-multiple-read-newline-*in*
+(#?(:clj def-repl-test :clje comment) request-multiple-read-newline-*in*
   ;; Verify that when ":ohai\n" is supplied (with a newline), a `(read)`
   ;; consumes :ohai but also consumes a newline, so that when we later give "a\n"
   ;; to stdin, and `(read-line)` is issued, it will return "a" and not the
@@ -728,7 +734,7 @@
   (session {:op "stdin" :stdin (th/newline->sys "a\n")})
   (is+ ["a"] (repl-values session "(read-line)")))
 
-(def-repl-test request-multiple-read-with-buffered-newline-*in*
+(#?(:clj def-repl-test :clje comment) request-multiple-read-with-buffered-newline-*in*
   (let [responses (repl-eval session "(read)")]
     (is+ {:status (mc/via #(map keyword %) [:need-input])} (first responses))
     (session {:op "stdin" :stdin (th/newline->sys ":ohai\na\n")})
@@ -736,7 +742,7 @@
 
   (is+ ["a"] (repl-values session "(read-line)")))
 
-(def-repl-test request-multiple-read-objects-*in*
+(#?(:clj def-repl-test :clje comment) request-multiple-read-objects-*in*
   (let [responses (repl-eval session "(read)")]
     (is+ {:status (mc/via #(map keyword %) [:need-input])} (first responses))
     (session {:op "stdin" :stdin (th/newline->sys ":ohai :kthxbai\n")})
@@ -744,7 +750,7 @@
 
   (is+ [" :kthxbai"] (repl-values session "(read-line)")))
 
-(def-repl-test test-url-connect
+(#?(:clj def-repl-test :clje comment) test-url-connect
   (with-open [^nrepl.transport.FnTransport
               conn (url-connect (str (transport-fn->protocol *transport-fn*)
                                      "://127.0.0.1:"
@@ -752,7 +758,7 @@
     (let [cli (nrepl/client conn Long/MAX_VALUE)]
       (is (= 2 (th/eval-value1 cli '(+ 1 1)))))))
 
-(deftest test-ack
+(#?(:clj deftest :clje comment) test-ack
   (with-open [s (server/start-server :transport-fn *transport-fn*
                                      :handler (-> (server/default-handler)
                                                   ack/handle-ack))]
@@ -761,13 +767,13 @@
                                         :ack-port (:port s))]
       (is (= (:port s2) (ack/wait-for-ack 10000))))))
 
-(def-repl-test agent-await
+(#?(:clj def-repl-test :clje comment) agent-await
   (is+ [42] (repl-values session (code (let [a (agent nil)]
                                          (send a (fn [_] (Thread/sleep 100) 42))
                                          (await a)
                                          @a)))))
 
-(deftest cloned-session-*1-binding
+(#?(:clj deftest :clje comment) cloned-session-*1-binding
   (let [port (:port *server*)
         ^nrepl.transport.FnTransport
         conn (connect :port port :transport-fn *transport-fn*)
@@ -791,7 +797,7 @@
                             :value)]
     (is+ "5" cloned-sess-*1)))
 
-(def-repl-test print-namespace-maps-binding
+(#?(:clj def-repl-test :clje comment) print-namespace-maps-binding
   (when (resolve '*print-namespace-maps*)
     (let [set-true (dorun (repl-eval session "(set! *print-namespace-maps* true)"))
           true-val (first (repl-values session "*print-namespace-maps*"))
@@ -800,7 +806,7 @@
       (is (= true true-val))
       (is (= false false-val)))))
 
-(def-repl-test interrupt-load-file
+(#?(:clj def-repl-test :clje comment) interrupt-load-file
   (let [resp (message session {:op "load-file"
                                :file (slurp (File. project-base-dir "load-file-test/nrepl/load_file_sample2.clj"))
                                :file-path "nrepl/load_file_sample2.clj"
@@ -816,7 +822,7 @@
              combine-responses
              clean-response))))
 
-(def-repl-test stdout-stderr
+(#?(:clj def-repl-test :clje comment) stdout-stderr
   (is+ {:ns "user" :out (str "5 6 7 \n 8 9 10" th/sys-newline) :value ["nil"]}
        (-> (repl-eval client (code (println 5 6 7 \newline 8 9 10)))
            combine-responses))
@@ -830,7 +836,7 @@
        (-> (repl-eval client (code (/ 1 0)))
            combine-responses)))
 
-(def-repl-test read-error-short-circuits-execution
+(#?(:clj def-repl-test :clje comment) read-error-short-circuits-execution
   (testing "read error prevents the remaining code from being read and executed"
     (is+ {:out mc/absent
           :value mc/absent
@@ -850,12 +856,12 @@
          (-> (repl-eval client ")]} 42")
              combine-responses))))
 
-(defn custom-repl-caught
+(#?(:clj defn :clje comment) custom-repl-caught
   [^Throwable t]
   (binding [*out* *err*]
     (println "foo" (type t))))
 
-(def-repl-test caught-options
+(#?(:clj def-repl-test :clje comment) caught-options
   (testing "bad symbol should fall back to default"
     (is+ [{::middleware.caught/error "Couldn't resolve var my.missing.ns/repl-caught"
            :status #{:nrepl.middleware.caught/error}}
@@ -904,12 +910,12 @@
                                 ::middleware.caught/print? 1})
               (mapv clean-response)))))
 
-(defn custom-session-repl-caught
+(#?(:clj defn :clje comment) custom-session-repl-caught
   [^Throwable t]
   (binding [*out* *err*]
     (println "bar" (.getMessage t))))
 
-(def-repl-test session-caught-options
+(#?(:clj def-repl-test :clje comment) session-caught-options
   (testing "setting *caught-fn* works"
     (is+ [{:ns "user" :value "#'nrepl.core-test/custom-session-repl-caught"}
           {:status #{:done}}]
@@ -966,7 +972,7 @@
 ;; pomegranate (and other classpath modifying libs?) target to enable hotloading
 
 ;; This is from pomegranate
-(defn classloader-hierarchy
+(#?(:clj defn :clje comment) classloader-hierarchy
   "Returns a seq of classloaders, with the tip of the hierarchy first.
    Uses the current thread context ClassLoader as the tip ClassLoader
    if one is not provided."
@@ -982,7 +988,7 @@
   (swap! captured-values-atom assoc key value)
   nil)
 
-(def-repl-test hotloading-common-classloader-test
+(#?(:clj def-repl-test :clje comment) hotloading-common-classloader-test
   (testing "Check if RT/baseLoader and ContexClassLoader have a common DCL ancestor"
     (repl-values session (code (nrepl.core-test/capture-value
                                 "base-loader"
@@ -996,7 +1002,7 @@
       (is (= base-loader ccl))))
   (reset! captured-values-atom {}))
 
-(def-repl-test classloader-chain-doesnt-grow-test
+(#?(:clj def-repl-test :clje comment) classloader-chain-doesnt-grow-test
   (testing "after doing regular evals, the classloader chain remains of the same length"
     (let [[chain-length] (repl-values session (code (count
                                                      (nrepl.core-test/classloader-hierarchy))))]
@@ -1006,7 +1012,7 @@
              (first (repl-values session (code (count
                                                 (nrepl.core-test/classloader-hierarchy))))))))))
 
-(def-repl-test custom-context-classloader-is-not-overwritten
+(#?(:clj def-repl-test :clje comment) custom-context-classloader-is-not-overwritten
   (testing "if user eval code has set the custom context classloader, then it persists"
     (repl-values session
                  (code
@@ -1022,7 +1028,7 @@
       (is good?)))
   (reset! captured-values-atom {}))
 
-(def-repl-test custom-context-classloader-is-used-for-loading
+(#?(:clj def-repl-test :clje comment) custom-context-classloader-is-used-for-loading
   ;; Libraries like lambdaisland.classpath install their own classloader as the
   ;; session thread's context classloader. Loading during eval has to resolve
   ;; through it - binding Compiler/LOADER to a DynamicClassLoader ancestor
@@ -1043,7 +1049,7 @@
       (is in-chain?)))
   (reset! captured-values-atom {}))
 
-(def-repl-test sanity-tests
+(#?(:clj def-repl-test :clje comment) sanity-tests
   (testing "eval"
     (are [expr result] (= result (first (repl-values session (code expr))))
       (+ 1 2) 3

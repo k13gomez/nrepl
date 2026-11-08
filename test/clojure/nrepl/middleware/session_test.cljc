@@ -16,7 +16,7 @@
 (def ^:dynamic *test-var1*)
 (def ^:dynamic *test-var2* :root)
 
-(deftest dynvar-defaults-test
+(#?(:clj deftest :clje comment) dynvar-defaults-test
   (testing "dynvar receives a default value from config"
     (with-redefs [config/config {:dynamic-vars {'nrepl.middleware.session-test/*test-var1* 1}}]
       (with-repl-server
@@ -32,6 +32,34 @@
       (with-repl-server
         (let [result (repl-values session "nrepl.middleware.session-test/*test-var2*")]
           (is (= [:override] result)))))))
+
+;; clojerl has no with-redefs, and on the BEAM the config comes from
+;; `config*`, which caches it. So the BEAM test sets the cache.
+#?(:clje
+   (defmacro ^:private with-config [config & body]
+     `(let [cache# @#'config/config-cache
+            old# @cache#]
+        (reset! cache# ~config)
+        (try ~@body (finally (reset! cache# old#))))))
+
+#?(:clje
+   (deftest dynvar-defaults-test
+     (testing "dynvar receives a default value from config"
+       (with-config {:dynamic-vars {'nrepl.middleware.session-test/*test-var1* 1}}
+         (with-repl-server
+           (let [result (repl-values session "nrepl.middleware.session-test/*test-var1*")]
+             (is (= [1] result))))))
+
+     (testing "config can override a dynvar that has a root value"
+       (with-config {}
+         (with-repl-server
+           (let [result (repl-values session "nrepl.middleware.session-test/*test-var2*")]
+             (is (= [:root] result)))))
+
+       (with-config {:dynamic-vars {'nrepl.middleware.session-test/*test-var2* :override}}
+         (with-repl-server
+           (let [result (repl-values session "nrepl.middleware.session-test/*test-var2*")]
+             (is (= [:override] result))))))))
 
 (defn- alive? [sid]
   (some? (session-util/resolve-session sid)))
@@ -51,8 +79,8 @@
       (repl-eval @busy-sess
                  (nrepl/code
                   (do (reset! nrepl.middleware.session-test/captured-thread
-                              (Thread/currentThread))
-                      (Thread/sleep 30000))))
+                              #?(:clj (Thread/currentThread) :clje (erlang/self)))
+                      #?(:clj (Thread/sleep 30000) :clje (timer/sleep 30000)))))
       (is (th/wait-for #(some? @captured-thread)))
       (is+ (mc/embeds [(session-id @idle-sess)
                        (session-id @busy-sess)])
@@ -65,7 +93,8 @@
                                  (alive? (session-id @busy-sess)))))))
 
     (testing "running evaluation is terminated with the session"
-      (is (th/wait-for #(not (.isAlive ^Thread @captured-thread)))))))
+      (is (th/wait-for #(not #?(:clj (.isAlive ^Thread @captured-thread)
+                                :clje (erlang/is_process_alive @captured-thread))))))))
 
 (deftest close-op-test
   (with-repl-server
@@ -102,8 +131,8 @@
   (with-repl-server
     (let [sid (nrepl/new-session client)
           session' (nrepl/client-session client :session sid)
-          resp (nrepl/message session' {:op "eval" :code "(Thread/sleep 30000)"})]
-      (Thread/sleep 100)
+          resp (nrepl/message session' {:op "eval" :code #?(:clj "(Thread/sleep 30000)" :clje "(timer/sleep 30000)")})]
+      #?(:clj (Thread/sleep 100) :clje (timer/sleep 100))
       (is+ {:status #{:done}}
            (-> (nrepl/message session' {:op "interrupt"})
                nrepl/combine-responses

@@ -1,0 +1,9 @@
+(ns matcher-combinators.test
+  "A small BEAM version of matcher-combinators.test. `match?` is a plain
+  function, so a failing `is` reports the values but not a diff."
+  (:require [matcher-combinators.matchers :as mc]))
+
+(defn match?
+  "Return true if `actual` matches `expected`."
+  [expected actual]
+  (mc/match-value expected actual))

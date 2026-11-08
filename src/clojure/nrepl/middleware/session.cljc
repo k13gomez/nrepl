@@ -15,6 +15,7 @@
    #?@(:clje [[nrepl.beam.compat :as compat
                :refer [assoc! conj! persistent! transient]]
               [nrepl.beam.queue :as queue]
+              [nrepl.beam.io :as beam-io]
               nrepl.in]))
   (:import
    #?@(:clj [(clojure.lang Compiler LineNumberingPushbackReader)
@@ -140,7 +141,7 @@
 
     (persistent! m)))
 
-(defn- add-per-message-bindings
+(#?(:clj defn- :clje comment) add-per-message-bindings
   "Add dynamic bindings to `bindings-map` that must be rebound for each message."
   [{:keys [file out-quota err-quota] :as msg} bindings-map]
   (let [;; *out* and *err* must be rebound on each new message.
@@ -148,10 +149,10 @@
              :out msg {::print/quota out-quota ::print/throw-on-quota-exceeded? false})
         err (print/replying-PrintWriter
              :err msg {::print/quota err-quota ::print/throw-on-quota-exceeded? false})
-        #?@(:clj [ctxcl (.getContextClassLoader (Thread/currentThread))])]
+        ctxcl (.getContextClassLoader (Thread/currentThread))]
     (-> bindings-map
         (assoc #'*msg* msg
-               #?@(:clj [Compiler/LOADER ctxcl])
+               Compiler/LOADER ctxcl
                #'*out* out
                #'*err* err
                ;; clojure.test captures *out* at load-time, so we need to make
@@ -161,15 +162,44 @@
                ;; don't require beforehand in order to not add to loading times.
                (resolve 'clojure.test/*test-out*) out)
         (cond->
-         #?@(:clj [file (assoc #'*file* file)])))))
+         file (assoc #'*file* file)))))
 
 #?(:clje
-   (defn- close-message-writers
-     "Close the *out* and *err* writers of a message. On the BEAM each writer
-  is a process, so it must stop. Closing also sends the last output."
-     [bindings]
-     (doseq [v [#'*out* #'*err*]]
-       (some-> (get bindings v) (.close)))))
+   (defn- respond-output
+     "Send the output `text` of `msg` as a response with key `stream`."
+     [msg stream text]
+     (t/respond-to msg stream text)))
+
+#?(:clje
+   (defn- add-per-message-bindings
+     "Add dynamic bindings to `bindings-map` that must be rebound for each message.
+
+  The session has one output server for *out* and one for *err*. The writers
+  of this message tag their output with it. The *out* server also becomes the
+  group leader of the calling process, so raw Erlang output reaches the client."
+     [{:keys [session out-quota err-quota] :as msg} bindings-map]
+     (let [{::keys [out-server err-server]} (meta session)
+           out (beam-io/replying-writer out-server msg respond-output out-quota)
+           err (beam-io/replying-writer err-server msg respond-output err-quota)]
+       (beam-io/begin-message out-server msg respond-output out-quota)
+       (beam-io/begin-message err-server msg respond-output err-quota)
+       (erlang/group_leader out-server (erlang/self))
+       (assoc bindings-map
+              #'*msg* msg
+              #'*out* out
+              #'*err* err
+              ;; clojure.test captures *out* at load-time, so we need to make
+              ;; sure runtime output of test status/results is redirected
+              ;; properly.
+              (resolve 'clojure.test/*test-out*) out))))
+
+#?(:clje
+   (defn- end-message-output
+     "Send the last output of the message `msg` and wait until it went out."
+     [msg]
+     (let [{::keys [out-server err-server]} (meta (:session msg))]
+       (beam-io/end-message err-server msg)
+       (beam-io/end-message out-server msg))))
 
 (#?(:clj defn :clje comment) make-ephemeral-exec-fn
   "Return an exec function that should be attached to ephemeral sessions.
@@ -206,13 +236,12 @@
            (push-thread-bindings bindings)
            (try (thunk)
                 ;; The output must reach the client before the ack.
-                (close-message-writers bindings)
+                (end-message-output (or explicit-msg msg))
                 (some-> ack (apply nil))
                 (finally
                   (pop-thread-bindings)
-                  (close-message-writers bindings)
-                  ;; The session goes away, so its stdin process must stop.
-                  (some-> (get @session #'*in*) (.close)))))))))
+                  ;; The session goes away, so its processes must stop.
+                  (some-> (:close (meta (:session (or explicit-msg msg)))) (apply nil)))))))))
 
 (#?(:clj defn :clje comment) session-exec
   "Takes a session and returns a map of three functions:
@@ -337,7 +366,7 @@
                                        (dissoc #'*msg*))))
                   (pop-thread-bindings)
                   ;; The output must reach the client before the ack.
-                  (close-message-writers bindings)
+                  (end-message-output msg)
                   (let [state-d @state]
                     ;; An interrupt kills this process, so only a replaced
                     ;; worker can see another one in the state.
@@ -351,20 +380,44 @@
                 ;; (e.g., it does when responding to a closed transport). But make
                 ;; sure we are still the primary process for the session.
                 (when (= (:worker @state) (erlang/self))
-                  (ignore-exceptions
-                   (some-> (:running @state)
-                           (t/respond-to :status #{:done :error :uncaught-session-exception})))
-                  (ignore-exceptions
-                   (some-> (session-util/resolve-session session-id)
-                           (session-util/close-session))))))
+                  ;; Close before the reply, so that a client that sees the
+                  ;; reply also sees the session gone.
+                  (let [running (:running @state)]
+                    (ignore-exceptions
+                     (some-> (session-util/resolve-session session-id)
+                             (session-util/close-session)))
+                    (ignore-exceptions
+                     (some-> running
+                             (t/respond-to :status #{:done :error :uncaught-session-exception})))))))
            reset-state
-           ;; The worker waits for :go, so that it reads the new state.
-           #(let [worker (erlang/spawn (fn [] (receive* :go :ok) (session-loop)))]
-              (some-> (:queue @state) (queue/close))
-              (reset! state {:queue (queue/start false)
-                             :running nil
-                             :worker worker})
-              (erlang/send worker :go))]
+           (fn reset-state []
+             ;; The worker waits for :go, so that it reads the new state.
+             (let [worker (erlang/spawn (fn [] (receive* :go :ok) (session-loop)))]
+               (some-> (:queue @state) (queue/close))
+               (reset! state {:queue (queue/start false)
+                              :running nil
+                              :worker worker})
+               ;; A worker can die without an interrupt, for example from an
+               ;; exit signal of a linked process. A watcher then ends the
+               ;; running message, so the client does not wait forever. An
+               ;; interrupt or a close kills the worker with reason `killed`.
+               (erlang/spawn
+                (fn []
+                  (let [ref (erlang/monitor :process worker)]
+                    (receive*
+                     #erl[:DOWN ref _ _ reason]
+                     (let [{:keys [running] :as state-d} @state]
+                       (when (and (not (contains? #{:normal :killed} reason))
+                                  (= worker (:worker state-d))
+                                  (compare-and-set! state state-d (assoc state-d :running nil)))
+                         (when running
+                           (ignore-exceptions
+                            (t/respond-to running {:status #{:eval-error}
+                                                   :ex (str "class " (compat/error-name :exit reason))
+                                                   :root-ex (str "class " (compat/error-name :exit reason))}))
+                           (ignore-exceptions (t/respond-to running :status :done)))
+                         (reset-state)))))))
+               (erlang/send worker :go)))]
        (reset-state)
        {:interrupt (fn [exec-id]
                      ;; nil means interrupt whatever is running
@@ -380,7 +433,11 @@
                            (reset-state)
                            running))))
         :close #(let [{:keys [worker queue]} @state]
-                  (threading/interrupt-stop worker)
+                  ;; The worker closes its own session after an uncaught
+                  ;; exception. It ends right after, so it must not kill
+                  ;; itself before the session is unregistered.
+                  (when-not (= worker (erlang/self))
+                    (threading/interrupt-stop worker))
                   (queue/close queue))
         :exec (fn this
                 ([exec-id r ack]
@@ -419,20 +476,26 @@
      [{:keys [transport] :as msg} base-session persistent?]
      (let [id (uuid)
            qpr (session-in id transport)
+           out-server (beam-io/session-output :out print/*buffer-size*)
+           err-server (beam-io/session-output :err print/*buffer-size*)
            new-session (atom (assoc (or (some-> base-session deref)
                                         (gather-initial-bindings msg))
                                     #'*in* qpr))
            exec-fns (if persistent?
                       (session-exec new-session id)
-                      {:exec (make-ephemeral-exec-fn new-session msg)})]
+                      {:exec (make-ephemeral-exec-fn new-session msg)})
+           exec-close (:close exec-fns)]
        ;; clojerl atoms do not support reset-meta!. An atom with new meta
        ;; shares the state of the original.
        (with-meta new-session
-         (merge {:id id, :transport transport, ::queue-reader qpr}
+         (merge {:id id, :transport transport, ::queue-reader qpr
+                 ::out-server out-server, ::err-server err-server}
                 exec-fns
-                (when-let [close (:close exec-fns)]
-                  ;; The stdin process of the session must stop too.
-                  {:close #(do (close) (.close qpr))}))))))
+                ;; The stdin process and the output servers stop too.
+                {:close #(do (some-> exec-close (apply nil))
+                             (.close qpr)
+                             (erlang/send out-server :close)
+                             (erlang/send err-server :close))})))))
 
 (defn- clone-session
   "Clone bindings of the provided session (or create a fresh one) and

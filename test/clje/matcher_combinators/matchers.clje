@@ -1,0 +1,92 @@
+(ns matcher-combinators.matchers
+  "A small BEAM version of the matcher-combinators matchers that the nREPL
+  tests use. matcher-combinators does not run on clojerl.")
+
+(defrecord Matcher [kind args])
+
+(def absent
+  "Matches when the key is not in the map. It is a keyword, because
+  clojerl accepts only literal values in a top-level def."
+  ::absent)
+
+(defn embeds
+  "Matches a map with at least these entries, a sequence that contains
+  matches for these items in any order, or a set that contains them."
+  [expected]
+  (->Matcher :embeds expected))
+
+(defn equals
+  "Matches exactly: a map has no other keys, a sequence has these items in
+  this order, and a set has these items."
+  [expected]
+  (->Matcher :equals expected))
+
+(defn via
+  "Matches when `(f actual)` matches `expected`."
+  [f expected]
+  (->Matcher :via [f expected]))
+
+(defn all-of
+  "Matches when all of `matchers` match."
+  [& matchers]
+  (->Matcher :all-of matchers))
+
+(defn mismatch
+  "Matches when `expected` does not match."
+  [expected]
+  (->Matcher :mismatch expected))
+
+(declare match-value)
+
+(defn- match-map [expected actual exact?]
+  (and (map? actual)
+       (every? (fn [[k v]]
+                 (if (= ::absent v)
+                   (not (contains? actual k))
+                   (and (contains? actual k) (match-value v (get actual k)))))
+               expected)
+       (or (not exact?)
+           (every? #(contains? expected %) (keys actual)))))
+
+(defn- match-unordered
+  "Return true if each item of `expected` matches a different item of
+  `actual`."
+  [expected actual]
+  (loop [expected (seq expected)
+         actual (vec actual)]
+    (if-let [[e & more] expected]
+      (when-let [i (first (keep-indexed (fn [i a] (when (match-value e a) i)) actual))]
+        (recur more (into (subvec actual 0 i) (subvec actual (inc i)))))
+      true)))
+
+(defn match-value
+  "Return true if `actual` matches `expected`."
+  [expected actual]
+  (cond
+    (instance? Matcher expected)
+    (let [{:keys [kind args]} expected]
+      (case kind
+        :embeds (cond
+                  (map? args) (match-map args actual false)
+                  :else (and (coll? actual) (match-unordered args actual)))
+        :equals (cond
+                  (map? args) (match-map args actual true)
+                  (set? args) (and (coll? actual) (= (count args) (count actual))
+                                   (match-unordered args actual))
+                  (sequential? args) (and (sequential? actual)
+                                          (= (count args) (count actual))
+                                          (every? true? (map match-value args actual)))
+                  :else (= args actual))
+        :via (let [[f e] args] (match-value e (f actual)))
+        :all-of (every? #(match-value % actual) args)
+        :mismatch (not (match-value args actual))))
+
+    (map? expected) (match-map expected actual false)
+    (set? expected) (and (coll? actual) (= (count expected) (count actual))
+                         (match-unordered expected actual))
+    (sequential? expected) (and (sequential? actual)
+                                (= (count expected) (count actual))
+                                (every? true? (map match-value expected actual)))
+    (instance? erlang.util.Regex expected) (and (string? actual) (some? (re-find expected actual)))
+    (fn? expected) (boolean (expected actual))
+    :else (= expected actual)))
